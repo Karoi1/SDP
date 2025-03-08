@@ -12,7 +12,7 @@ import os
 import io
 
 class client:
-    def __init__(self, server_ip, server_port, Tx, prefer=1, batchN=64, zipMetric=None):
+    def __init__(self, server_ip, server_port, Tx, prefer=1, batchN=128, zipMetric=None):
         self.server_ip = server_ip
         self.server_port = server_port
         self.prefer = prefer
@@ -25,6 +25,8 @@ class client:
         self.state = "offline"
         self.trainset_loader = None
         self.testset_loader = None
+        self.itertrain = None
+        self.itertest = None
         self.SDL = {}
         self.batchN = batchN
         self.batch_idx = 0
@@ -38,7 +40,12 @@ class client:
             "prefer": self.prefer
         })
 
-    
+    # TODO generate message (type, mes)
+    def generate_message(self, type, mes=None):
+        if type == "End":
+            m = json.dumps({"type": type})
+            return m
+        return json.dumps({"type": type})
     def start(self):
         self.prepare_data()
         print("========= Client started =========")
@@ -56,14 +63,18 @@ class client:
             if self.state == "working":
                 if self.mode == "train":
                     self.batch = self.get_next_train_batch()
+                    if self.batch is None:
+                        self.mode = "test"
+                        continue 
+
                 if self.mode == "test":
                     self.batch = self.get_next_test_batch()
+                    if self.batch is None:
+                        self.formal_end() 
+
                 if self.batch is not None:
                     self.compute_smashed_data(self.batch)
-                if self.batch is None and self.mode == "train":
-                    self.mode = "test"
-                if self.batch is None and self.mode == "test":
-                    self.disconnect()
+
             if self.state == "ready upload":
                 self.upload_SDL_to_server()
             if self.state == "wait gradient":
@@ -72,7 +83,11 @@ class client:
                 self.update_model()
         print("========= Client stopped =========")
 
-
+    def formal_end(self):
+        print("end")
+        m = self.generate_message("End")
+        self.sendmes(m)
+        self.disconnect()
     def prepare_data(self):
     
         # 定义数据预处理操作
@@ -85,13 +100,15 @@ class client:
         try:
             # 下载并加载训练集
             trainset = torchvision.datasets.MNIST(root='./data', train=True, download=True, transform=transform)
-            trainloader = torch.utils.data.DataLoader(trainset, batch_size=64, shuffle=True)
+            trainloader = torch.utils.data.DataLoader(trainset, batch_size=self.batchN, shuffle=True)
             self.trainset_loader = trainloader
+            self.itertrain = iter(trainloader)
 
             # 下载并加载测试集
             testset = torchvision.datasets.MNIST(root='./data', train=False, download=True, transform=transform)
-            testloader = torch.utils.data.DataLoader(testset, batch_size=64, shuffle=False)
+            testloader = torch.utils.data.DataLoader(testset, batch_size=self.batchN, shuffle=False)
             self.testset_loader = testloader
+            self.itertest = iter(testloader)
 
         except Exception as e:
             print(f" !! State: {self.state} | prepare_data() error: {e}")
@@ -101,12 +118,12 @@ class client:
     
     def get_next_train_batch(self):
         try:
-            return next(iter(self.trainset_loader))
+            return next(self.itertrain)
         except StopIteration:
             return None
     def get_next_test_batch(self):
         try:
-            return next(iter(self.testset_loader))
+            return next(self.itertest)
         except StopIteration:
             return None
     def upload_SDL_to_server(self):
@@ -122,7 +139,10 @@ class client:
             self.disconnect()
             return
         self.sendmes(sdl_json)
-        self.state = "wait gradient"
+        if self.mode == "train":
+            self.state = "wait gradient"
+        if self.mode == "test":
+            self.state = "working"
         self.SDL = None
         print("==> Complete: upload_SDL_to_server()")
         print("-------------------------------------------")
@@ -194,7 +214,7 @@ class client:
         optimizer.zero_grad()
 
         self.gradient = None
-        self.state = "online waiting"
+        self.state = "working"
         print(f"==> complete: update_model()")
         print("-------------------------------------------")
     def create_dynamicMLP(self, inputSize, width, layersN):
@@ -261,7 +281,7 @@ class client:
     def try_login(self):
         print(f"==> Start: try_login()")
         try:
-            message = self.socket.recv(1024)
+            message = self.socket.recv(1024).decode('utf8')
         except Exception as e:
             print(f" !! State: {self.state} | try_login() -> error: {e}")
             self.disconnect()
@@ -327,7 +347,7 @@ class client:
     def receive_model_from_server(self):
         print(f"==> Start: receive_model_from_server()")
         try:
-            data = self.socket.recv(1024000).decode('utf8')
+            data = self.socket.recv(pow(2,24)).decode('utf8')
         except socket.error as e:
             print(f" !! State: {self.state} | receive_model_from_server() recv msg error -> MSG: {data}, error: {e}")
             self.disconnect()

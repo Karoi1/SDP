@@ -12,6 +12,9 @@ import base64
 import io
 import random
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 
 class modelManager:
     def __init__(self):
@@ -25,31 +28,44 @@ class modelManager:
             :split_layer: specify the split layer of the model.
             :Where server-side compute layer = [split_layer:]
         Return:
-            :Bool: Whether model is successful created
+            :Int: the id of model if successfully created
+            :None: if fail to create
             :Str: error message
         """
         
         if len(shape) != 4:
-            return False, f" !! Model Manager | addModel(): expect len(shape)==4, get {len(shape)}"
+            return None, f" !! Model Manager | addModel(): expect len(shape)==4, get {len(shape)}"
         I,W,O,L = shape
         if I is None or W is None or O is None or L is None:
-            return False, f" !! Model Manager | addModel(): One of the item in shape is None"
+            return None, f" !! Model Manager | addModel(): One of the item in shape is None"
         self.idcounter += 1
         modelID = self.idcounter
-        Newmodel = modelItem(shape, modelID, split_layer)
+        Newmodel = modelItem(shape, id=modelID, split_layer=split_layer)
         self.Listmodel = np.append(self.Listmodel, Newmodel)
-        return True, ""
+        return modelID, ""
 
-    def getRandomModel(self, split_layer):
+    def check_model_exist(self, split_layer):
         """
-        Get a random Full model which is of the corresponding split layer
+        check whether there is model of the corresponding split layer
         Parameters:
-            :id: the id of the model
+            :split_layer: the split layer of the model
         Return:
-            :modelItem(): if the model is found
+            :Bool: if model found
+        """
+        item = next((item for item in self.Listmodel if item.split_layer == split_layer), None)
+        if item is None:
+            return False
+        return True
+    def getRandomModelID(self, split_layer):
+        """
+        Get the id of a random model which is of the corresponding split layer
+        Parameters:
+            :split_layer: the split layer of model
+        Return:
+            :Int: Model ID, if the model is found
             :None: if no model found
         """
-        L = np.array([item for item in self.Listmodel if item.split_layer==split_layer])
+        L = np.array([item.id for item in self.Listmodel if item.split_layer==split_layer])
         if L.size == 0:
             return None
         return random.choice(L)
@@ -81,22 +97,22 @@ class modelManager:
         full, error = self.getModel(id)
         if full is None:
             return None, error
-        if full.split_layer < 2:
-            return None, f" !! Model Manager | getClientModel: model.split_layer = {full.split_layer} < 2"
+        if full.split_layer < 1:
+            return None, f" !! Model Manager | getClientModel: model.split_layer = {full.split_layer} < 1"
         
-        I,W,O,L = full.shape
+        I,W,_,_ = full.shape
         split_layer = full.split_layer
-        subShape = np.array([I,W,W,split_layer-1])
+        subShape = np.array([I,W,W,split_layer])
         CM = modelItem(subShape)
-
+        #print(CM.model)
         # copy the full model weight into sub model
         for i in range(split_layer):
-            print(CM.layers[i].weight.shape)
-            CM.layers[i].weight.data.copy_(full.layers[i].weight.data)
-            CM.layers[i].bias.data.copy_(full.layers[i].bias.data)
+            #print(CM.model.layers[i].weight.shape)
+            CM.model.layers[i].weight.data.copy_(full.model.layers[i].weight.data)
+            CM.model.layers[i].bias.data.copy_(full.model.layers[i].bias.data)
         return CM, ""
     
-    def forward_for_id(self, id, smashed_data):
+    def forward_for_id(self, id, smashed_data, labels):
         """
         Forward the smashed data(at split layer) for the model of corresponding id. Only eval, will not train the model
         Parameters:
@@ -111,18 +127,29 @@ class modelManager:
         if item is None:
             return None, error
         model = item.model
+        model.eval()
         split_layer = item.split_layer
-        x = model.forward(smashed_data, split_layer)
-        return x, ""
+        with torch.no_grad():
+            outputs = model.forward(smashed_data, split_layer)
+            criterion = nn.CrossEntropyLoss()
+            loss = criterion(outputs,labels)
+            item.test_loss_hist = np.append(item.test_loss_hist, loss.item())
+
+            _, predicted = torch.max(outputs,1)
+            correct = (predicted == labels).sum().item()
+            accuracy = correct/labels.size(0)
+            item.train_accuracy_hist = np.append(item.train_accuracy_hist, accuracy)
+        return outputs, ""
     
-    def train_for_id(self, id, smashed_data):
+    def train_for_id(self, id, smashed_data, labels):
         """
         Train the model of corresponding id with smashed data(at split layer). 
         Parameters:
             :id: the id of the model
             :smashed_data: smashed data at split layer
+            :labels: labels of the smashed data
         Return:
-            :Tensor: if the model is found, forward and output the smashed data
+            :Tensor: the gradient at split layer if model found
             :None: if no model found
             :Str: error message
         """
@@ -132,19 +159,28 @@ class modelManager:
         model = item.model
         optimizer = item.optimizer
         lock = item.lock
-
+        split_layer = item.split_layer
         with lock:
             smash_data = torch.tensor(smashed_data, dtype=torch.float32)
             labels = torch.tensor(labels, dtype=torch.long)
 
             criterion = nn.CrossEntropyLoss()
 
-            outputs = model.forward(smash_data)
+            outputs = model.forward(smash_data, split_layer)
             loss = criterion(outputs, labels)
+            # record the loss
+            item.train_loss_hist = np.append(item.train_loss_hist, loss.item())
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+
+            # record the accuracy
+            _, predicted = torch.max(outputs,1)
+            correct = (predicted == labels).sum().item()
+            accuracy = correct/labels.size(0)
+            item.train_accuracy_hist = np.append(item.train_accuracy_hist, accuracy)
+
         return self.get_split_layer_gradient(id)
 
     def get_split_layer_gradient(self, id):
@@ -153,7 +189,7 @@ class modelManager:
         Parameters:
             :id: the id of the model
         Return:
-            :Tensor: if the model is found, forward and output the smashed data
+            :Tensor: the gradient at split layer if model found
             :None: if no model found
             :Str: error message
         """
@@ -184,6 +220,10 @@ class modelItem:
         self.build_model()
         self.optimizer = torch.optim.Adam(self.model.parameters(),lr=self.lr)
         self.lock = threading.Lock()
+        self.train_accuracy_hist = np.array([],dtype=np.float32)
+        self.train_loss_hist = np.array([],dtype=np.float32)
+        self.test_accuracy_hist = np.array([],dtype=np.float32)
+        self.test_loss_hist = np.array([],dtype=np.float32)
     def build_model(self):
         I,W,O,L = self.shape
         self.model = DynamicMLP(I,W,O,L)
@@ -236,13 +276,20 @@ class Client:
         self.socket = socket
         self.state = state
         self.prefer = prefer
-        self.SD = None
-        self.L = None
+        self.trainSD = None
+        self.trainL = None
+        self.testSD = None
+        self.testL = None
         self.gradient = None
         self.batchN = None
         self.subscribe = subscribe
         self.modelID = None
-
+    def is_no_info(self):
+        attrList = ['trainSD', 'trainL', 'testSD', 'testL', 'gradient']
+        for i in attrList:
+            if getattr(self, i) is not None:
+                return False
+        return True
 class Server:
     def __init__(self, host, port, max_connections, max_workers, max_wait_queue=5, broadcast_interval=60, input_size=784, output_size=10, modelL=3, modelW=5):
         
@@ -288,14 +335,14 @@ class Server:
         self.outputSize = output_size
         self.modelL = modelL
         self.modelW = modelW
-        self.Listmodel = {}
-        self.model_id_counter = 0
-        self.lr = 0.001
+        self.shape = [input_size,modelW,output_size,modelL]
+        self.MM = modelManager()
     def start(self):
         print("creating socket...")
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_socket.bind((self.host, self.port))
         self.server_socket.listen(self.max_connections)
+        self.server_socket.settimeout(1)
 
         print("initialize brocast thread...")
         # 启动定时广播线程
@@ -318,7 +365,7 @@ class Server:
         model_distributor_thread.daemon = True
         model_distributor_thread.start()
 
-        model_updater_thread = threading.Thread(target=self.update_model)
+        model_updater_thread = threading.Thread(target=self.model_updator)
         model_updater_thread.daemon = True
         model_updater_thread.start()
 
@@ -331,8 +378,11 @@ class Server:
 
         try:
             while self.running:
-                client_socket, client_addr = self.server_socket.accept()
-                print(f"-> Listen: connection from: {client_addr}")
+                try:
+                    client_socket, client_addr = self.server_socket.accept()
+                    print(f"-> Listen: connection from: {client_addr}")
+                except socket.timeout:
+                    continue
 
                 client = Client(client_addr, socket=client_socket)
                 with self.clients_lock:
@@ -370,53 +420,18 @@ class Server:
             broadcast_thread.join()
             check_queue_thread.join()
     
-    def create_DynamicMLP(self, I, W, O, L, start_layer=1, sub=False):
-        if not sub:
-            self.model_id_counter += 1
-            return DynamicMLP(I, W, O, L, self.model_id_counter, start_layer)
-        return DynamicMLP(I, W, O, L, -1, start_layer)
-    def back_propagate(self, model, optimizer, lock, smashed_data, labels):
-        with lock:
-            try:
-                smash_data = torch.tensor(smashed_data, dtype=torch.float32)
-                labels = torch.tensor(labels, dtype=torch.long)
-
-                criterion = nn.CrossEntropyLoss()
-
-                outputs = model.forward(smash_data)
-                loss = criterion(outputs, labels)
-
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-
-                return self.get_Nth_layer_gradients(model)
-            except Exception as e:
-                print(f" !! back_propagate error | {e}")
-    def foward_propagate(self, model, smashed_data):
-        return model.forward(smashed_data)
-    def get_Nth_layer_gradients(self, model):
-        gradients = []
-        i = 0
-        for param in model.parameters():
-            #print(param.shape)
-            if param.grad is not None:
-                #print(i)
-                gradients.append(param.grad.data.clone())
-                i+=1
-                if i >= 2:
-                    break
-        return gradients[0]
 
     def generate_messages(self, type, message=None):
         if type == "loginState":
             return json.dumps({"type": type, "value": message})
         if type == "model":
             binary_data = self.tensor_to_byte(message[0].state_dict())
+            print(len(binary_data))
             shape = message[1:]
+            #print(shape)
             return json.dumps({"type": type, "shape": shape, "binary_data": binary_data})
         if type == "hb":
-            return json.dumps({"type": type}).encode("utf-8")
+            return json.dumps({"type": type}).encode('utf-8')
         if type == "gradient":
             binary_data = self.tensor_to_byte(message)
             return json.dumps({"type": type, "G": binary_data})
@@ -438,7 +453,7 @@ class Server:
                         client.socket.sendall(m)
                         # 如果客户端断开，会抛出异常
                     except (socket.error, OSError):
-                        if client.SD is None and client.L is None and client.gradient is None:
+                        if client.is_no_info():
                             offline_clients.append(client)
 
                 # 从客户端列表中移除离线客户端
@@ -481,15 +496,21 @@ class Server:
         except Exception as e:
             print(f" !! send_client_mes Error | ip: {client.ip_address} | e: {e} | m: {mes}")
         
-    def divide_model(self, client, model):
-        sub_model = self.create_DynamicMLP(self.inputSize, self.modelW, self.modelW, client.prefer, sub=True)
-        for i in range(client.prefer):
-            print(sub_model.layers[i].weight.shape)
-            sub_model.layers[i].weight.data.copy_(model.layers[i].weight.data)
-            sub_model.layers[i].bias.data.copy_(model.layers[i].bias.data)
-
-        return sub_model, self.inputSize, self.modelW, client.prefer
-
+    def model_tester(self):
+        while self.running:
+            time.sleep(0.5)
+            with self.clients_lock:
+                #print("update model check")
+                for client in self.clients:
+                    #print(f"ip: {client.ip_address}")
+                    if client.testSD is not None and client.testL is not None:
+                        id = client.modelID
+                        smashed_data = client.testSD
+                        labels = client.testL
+                        self.MM.forward_for_id(id,smashed_data,labels)
+                        client.testSD = None
+                        client.testL = None
+                        #print(client.ip_address,"train")
     def model_distributor(self):
         while self.running:
             time.sleep(self.DMCD)
@@ -497,78 +518,44 @@ class Server:
                 counter = 0
                 for client in self.clients:
                     if client.state == "online waiting":
-                        model, _, lock = self.select_model(client)
-                        if model is None:
-                            print("no model found")
-                            print(client.modelID)
-                            break
-                        with lock:
-                            sub_model,I,W,L = self.divide_model(client,model)
-                        m = self.generate_messages("model", [sub_model,I,W,L])
+                        #print(client.ip_address)
+                        id = client.modelID
+                        item, e = self.MM.getClientModel(id)
+                        if item is None:
+                            print(e)
+                        I,W,O,L = item.shape
+                        sub_model = item.model
+                        m = self.generate_messages("model", [sub_model,int(I),int(W),int(L)])
                         self.send_client_mes(client, m)
                         client.state = "working"
                         counter += 1
             if counter != 0:
                 print(f"-> Model distributor: send model to {counter} clients")
 
-    def select_model(self, client, Rand=False):
-        prefer = client.prefer
-        if prefer not in self.Listmodel.keys():
-            print(f" !! select_model | -> Client: {client.ip_address} prefer: {prefer}, no model found")
-            return
-        if Rand:
-            model, optimizer, lock = random.choice(self.Listmodel[prefer])
-        if not Rand:
-            for k in self.Listmodel.keys():
-                model, optimizer, lock = next(((m,o,l) for m,o,l in self.Listmodel[k] if m.id == client.modelID), (None,None,None))
-                if model is not None:
-                    break
-        return model, optimizer, lock
-
-    def add_model(self, start_layer, new=False):
-        if start_layer not in self.Listmodel.keys():
-            Newmodel = self.create_DynamicMLP(self.inputSize, self.modelW, self.outputSize, self.modelL, start_layer)
-            optimizer = torch.optim.Adam(Newmodel.parameters(),lr=self.lr)
-            lock = threading.Lock()
-            self.Listmodel[start_layer] = [(Newmodel, optimizer, lock)]
-        if start_layer in self.Listmodel.keys() and new:
-            Newmodel = self.create_DynamicMLP(self.inputSize, self.modelW, self.outputSize, self.modelL, start_layer)
-            optimizer = torch.optim.Adam(Newmodel.parameters(),lr=self.lr)
-            lock = threading.Lock()
-            self.Listmodel[start_layer].append((Newmodel, optimizer, lock))
-        return self.model_id_counter
-
-    def receive_clientTx(self, client, tx):
-        client.tx = tx
-        client.state = "ready"
-        print(f"客户端 {client.ip_address} Tx: {tx}")
     
     def tensor_to_byte(self, tensor):
         binary_data = io.BytesIO()
         torch.save(tensor, binary_data)
         return base64.b64encode(binary_data.getvalue()).decode("utf-8")
-    def update_model(self):
+    def model_updator(self):
         while self.running:
-            time.sleep(self.UDCD)
+            time.sleep(0.1)
             with self.clients_lock:
-                #print("update model check")
                 for client in self.clients:
                     #print(f"ip: {client.ip_address}")
-                    if client.SD is not None and client.L is not None:
-                        smashed_data = client.SD
-                        labels = client.L
-                        model, optimizer, lock = self.select_model(client)
-                        gradient = self.back_propagate(model, optimizer, lock, smashed_data, labels)
+                    if client.trainSD is not None and client.trainL is not None:
+                        id = client.modelID
+                        smashed_data = client.trainSD
+                        labels = client.trainL
+                        gradient, _ = self.MM.train_for_id(id,smashed_data,labels)
                         client.gradient = gradient
-                        #m = self.generate_messages("gradients", gradients)
-                        #self.send_client_mes(client, m)
-                        client.SD = None
-                        client.L = None
-                        #print(f"-> Client: {client.ip_address} gradients: {gradients.shape}")
+                        client.trainSD = None
+                        client.trainL = None
+                        #print(client.ip_address,"train")
 
     def gradient_distributor(self):
         while self.running:
-            time.sleep(5)
+            time.sleep(0.1)
             with self.clients_lock:
                 counter = 0
                 for client in self.clients:
@@ -586,28 +573,93 @@ class Server:
         type = data.get('type')
         if type == "info":
             client.Tx = data.get('Tx')
+            # client want to compute 0~n-1 layer, then search for split layer n
             prefer = data.get('prefer')
             client.prefer = prefer
-            newModelID = self.add_model(client.prefer)
-            client.modelID = newModelID
+            #print("prefer",prefer)
+            if self.MM.check_model_exist(prefer):
+                client.modelID = self.MM.getRandomModelID(prefer)
+            else:
+                id, error = self.MM.addModel(self.shape, prefer)
+                if id is None:
+                    print(f" !! parse_handle_mes | data: {data} | error: {error}")
+                client.modelID = id
 
             if client.state == "online":
                 client.state = "online waiting"
+                
             return
         if type == "train SDL":
             if client.state == "working":
-                client.SD = data.get('SD')
-                client.L = data.get('L')
+                client.trainSD = data.get('SD')
+                client.trainL = data.get('L')
                 client.batchN = data.get('batchN')
-                print(f"received batch {len(client.L)}")
+                print(f"received batch {len(client.trainL)}")
             else:
                 print(f"~ parse_handle_mes: receive train SDL for non working client | state: {client.state}, ip: {client.ip_address}")
             return
         if type == "test SDL":
-            SD = data.get('SD')
-            L = data.get('L')
+            client.testSD = data.get('SD')
+            client.testL = data.get('L')
             batchN = data.get('batchN')
             return
+        if type == "End":
+            print("end")
+            item,_ = self.MM.getModel(1)
+            print(item.split_layer)
+            train_loss = item.train_loss_hist
+            train_accuracy = item.train_accuracy_hist
+            test_loss = item.test_loss_hist
+            test_accuracy = item.test_accuracy_hist
+            print(len(train_loss))
+            print(len(train_accuracy))
+            print(len(test_loss))
+            print(len(test_accuracy))
+            # 创建一个 2x2 的 subplot 布局
+            plt.figure(figsize=(14, 10))
+
+            # 第一个 subplot：训练损失
+            plt.subplot(2, 2, 1)  # 2行2列的第1个位置
+            plt.plot(train_loss, label='Train Loss', marker='o')
+            plt.title('Train Loss')
+            plt.xlabel('Epoch')
+            plt.ylabel('Loss')
+            plt.legend()
+            plt.grid(True)
+
+            # 第二个 subplot：训练准确率
+            plt.subplot(2, 2, 2)  # 2行2列的第2个位置
+            plt.plot(train_accuracy, label='Train Accuracy', marker='o', color='orange')
+            plt.title('Train Accuracy')
+            plt.xlabel('Epoch')
+            plt.ylabel('Accuracy')
+            plt.legend()
+            plt.grid(True)
+
+            # 第三个 subplot：测试损失
+            plt.subplot(2, 2, 3)  # 2行2列的第3个位置
+            plt.plot(test_loss, label='Test Loss', marker='o', color='green')
+            plt.title('Test Loss')
+            plt.xlabel('Epoch')
+            plt.ylabel('Loss')
+            plt.legend()
+            plt.grid(True)
+
+            # 第四个 subplot：测试准确率
+            plt.subplot(2, 2, 4)  # 2行2列的第4个位置
+            plt.plot(test_accuracy, label='Test Accuracy', marker='o', color='red')
+            plt.title('Test Accuracy')
+            plt.xlabel('Epoch')
+            plt.ylabel('Accuracy')
+            plt.legend()
+            plt.grid(True)
+
+            # 调整子图间距
+            plt.tight_layout()
+
+            # 显示整个图表
+            plt.savefig('img.png')
+            plt.close()
         print(f"~ parser: unknown data | ip: {client.ip_address} | d: {data}")
 
     def listen_client_mes(self, client):
@@ -618,7 +670,7 @@ class Server:
 
             while self.running:
                 try:
-                    mes = client.socket.recv(1024000).decode('utf-8')
+                    mes = client.socket.recv(pow(2,24)).decode('utf-8')
                     if not mes:
                         break
                     self.parse_handle_mes(client, mes)
