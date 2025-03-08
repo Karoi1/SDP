@@ -65,6 +65,7 @@ class client:
                     self.batch = self.get_next_train_batch()
                     if self.batch is None:
                         self.mode = "test"
+                        self.itertest = iter(self.testset_loader)
                         continue 
 
                 if self.mode == "test":
@@ -87,26 +88,27 @@ class client:
         print("end")
         m = self.generate_message("End")
         self.sendmes(m)
+        time.sleep(3)
         self.disconnect()
     def prepare_data(self):
     
-        # 定义数据预处理操作
+
         transform = transforms.Compose([
-            transforms.ToTensor(),  # 将图像转换为 PyTorch 张量
-            transforms.Normalize((0.5,), (0.5,))  # 归一化到 [-1, 1]
+            transforms.ToTensor(),
+            transforms.Normalize((0.5,), (0.5,)) 
         ])
         if not os.path.exists('./data/MNIST'):
             print("-> prepare data: Downloading MNIST dataset...")
         try:
-            # 下载并加载训练集
+
             trainset = torchvision.datasets.MNIST(root='./data', train=True, download=True, transform=transform)
-            trainloader = torch.utils.data.DataLoader(trainset, batch_size=self.batchN, shuffle=True)
+            trainloader = torch.utils.data.DataLoader(trainset, batch_size=self.batchN, shuffle=True, drop_last=True)
             self.trainset_loader = trainloader
             self.itertrain = iter(trainloader)
 
-            # 下载并加载测试集
+
             testset = torchvision.datasets.MNIST(root='./data', train=False, download=True, transform=transform)
-            testloader = torch.utils.data.DataLoader(testset, batch_size=self.batchN, shuffle=False)
+            testloader = torch.utils.data.DataLoader(testset, batch_size=self.batchN, shuffle=False, drop_last=True)
             self.testset_loader = testloader
             self.itertest = iter(testloader)
 
@@ -127,7 +129,7 @@ class client:
         except StopIteration:
             return None
     def upload_SDL_to_server(self):
-        print(f"==> Start: upload_SDL_to_server()")
+        #print(f"==> Start: upload_SDL_to_server()")
         if not self.SDL:
             print(f" !! State: {self.state} | upload_SDL_to_server() -> error: SDL is empty")
             self.disconnect()
@@ -144,10 +146,10 @@ class client:
         if self.mode == "test":
             self.state = "working"
         self.SDL = None
-        print("==> Complete: upload_SDL_to_server()")
-        print("-------------------------------------------")
+        #print("==> Complete: upload_SDL_to_server()")
+        #print("-------------------------------------------")
     def receive_gradient_from_server(self):
-        print(f"==> Start: receive_gradient_from_server()")
+        #print(f"==> Start: receive_gradient_from_server()")
         if self.socket is None:
             print(f" !! State: {self.state} | receive_gradient_from_server() -> error: socket is None")
             self.disconnect()
@@ -181,12 +183,12 @@ class client:
         
         self.state = "update local model"
         self.gradient = gradient
-        print(f"==> complete: receive_gradient_from_server()")
-        print("-------------------------------------------")
+        #print(f"==> complete: receive_gradient_from_server()")
+        #print("-------------------------------------------")
         
         
     def update_model(self):
-        print(f"==> Start: update_model()")
+        #print(f"==> Start: update_model()")
         if self.model is None:
             print(f" !! State: {self.state} | update_model() -> error: model is None")
             self.disconnect()
@@ -195,28 +197,26 @@ class client:
             print(f" !! State: {self.state} | update_model() -> error: gradient is None")
             self.disconnect()
             return
+        # get the input data at Lth layer
+        batch_data, _ = self.batch
+        batch_data = batch_data.view(batch_data.size(0), -1)
+        L_input = self.model.get_last_layer_input(batch_data)
         # receive L+1th layer gradient, backward to Lth layer
         layer_L = self.model.layers[-1]
-        L_weight_gradient = torch.matmul(self.gradient, layer_L.weight)
+        L_weight_gradient = torch.matmul(L_input.T, self.gradient).T
         L_bias_gradient = self.gradient.sum(dim=0)
-        if layer_L.weight.grad is None:
-            layer_L.weight.grad = L_weight_gradient.detach().clone()
-        else:
-            layer_L.weight.grad += L_weight_gradient.detach().clone()
 
-        if layer_L.bias.grad is None:
-            layer_L.bias.grad = L_bias_gradient.detach().clone()
-        else:
-            layer_L.bias.grad += L_bias_gradient.detach().clone()
+        layer_L.weight.grad = L_weight_gradient.detach().clone()
+        layer_L.bias.grad = L_bias_gradient.detach().clone()
 
-        optimizer = torch.optim.SGD(self.model.parameters(), lr=0.001)  # TODO: 用消息让server和client的lr同步
+        optimizer = torch.optim.SGD(self.model.parameters(), lr=0.0001)  # TODO: 用消息让server和client的lr同步
         optimizer.step()
         optimizer.zero_grad()
 
         self.gradient = None
         self.state = "working"
-        print(f"==> complete: update_model()")
-        print("-------------------------------------------")
+        #print(f"==> complete: update_model()")
+        #print("-------------------------------------------")
     def create_dynamicMLP(self, inputSize, width, layersN):
         if layersN < 1:
             print(f" !! State: {self.state} | create_dynamicMLP() -> error: layers must be at least 1")
@@ -234,11 +234,17 @@ class client:
                 for layer in self.layers:
                     x = torch.relu(layer(x))
                 return x
+            def get_last_layer_input(self,x):
+                with torch.no_grad():
+                    for i in range(layersN-1):
+                        x = torch.relu(self.layers[i](x))
+                return x
+
         return MLP(inputSize, width, layersN)
 
 
     def compute_smashed_data(self, batch):
-        print(f"==> Start: compute_smashed_data()")
+        #print(f"==> Start: compute_smashed_data()")
         if self.trainset_loader is None:
             print(f" !! State: {self.state} | compute_smashed_data() -> error: train set is None")
             self.disconnect()
@@ -269,8 +275,8 @@ class client:
             "batchN": len(batch_labels)
         }
         self.state = "ready upload"
-        print(f"==> Complete: compute_smashed_data()")
-        print("-------------------------------------------")
+        #print(f"==> Complete: compute_smashed_data()")
+        #print("-------------------------------------------")
 
     def upload_info(self):
         print(f"==> Start: upload_info()")

@@ -197,21 +197,22 @@ class modelManager:
         if item is None:
             return None, error
         model = item.model
-
+        split_layer = item.split_layer
         gradients = []
         i = 0
-        for param in model.parameters():
+        #print("get split = ",split_layer)
+        for name, param in model.named_parameters():
             #print(param.shape)
-            if param.grad is not None:
-                #print(i)
-                gradients.append(param.grad.data.clone())
-                i+=1
-                if i >= 2:
+            if "weight" in name:
+                if i == split_layer:
+                    gradients.append(param.grad.data.clone())
+                    #print(gradients[0].shape)
                     break
+                i += 1
         return gradients[0], ""
 
 class modelItem:
-    def __init__(self, shape, id=-1, lr=0.001, split_layer=0):
+    def __init__(self, shape, id=-1, lr=0.0001, split_layer=0):
         self.id = id
         self.split_layer = split_layer
         self.shape = shape
@@ -234,14 +235,10 @@ class modelItem:
 class DynamicMLP(nn.Module):
     def __init__(self, I, W, O, L):
         super(DynamicMLP, self).__init__()
-        # 创建输入层
+
         self.layers = nn.ModuleList([nn.Linear(I, W)])
-        
-        # 创建隐藏层
-        for _ in range(L - 2):  # 减去输入层和输出层
+        for _ in range(L - 2): 
             self.layers.append(nn.Linear(W, W))
-        
-        # 创建输出层
         if L > 1:
             self.layers.append(nn.Linear(W, O))
 
@@ -290,8 +287,8 @@ class Client:
             if getattr(self, i) is not None:
                 return False
         return True
-class Server:
-    def __init__(self, host, port, max_connections, max_workers, max_wait_queue=5, broadcast_interval=60, input_size=784, output_size=10, modelL=3, modelW=5):
+class Server:                    #TODO modelW = batch size send message
+    def __init__(self, host, port, max_connections, max_workers, max_wait_queue=5, broadcast_interval=60, input_size=784, output_size=10, modelL=5, modelW=128):
         
         # ip, port, listen socket
         self.host = host
@@ -347,18 +344,18 @@ class Server:
         print("initialize brocast thread...")
         # 启动定时广播线程
         broadcast_thread = threading.Thread(target=self.background_broadcast)
-        broadcast_thread.daemon = True  # 设置为守护线程，随主线程退出而退出
+        broadcast_thread.daemon = True
         #broadcast_thread.start()
 
         #print("initialize checker thread...")
         # check queue thread
         check_queue_thread = threading.Thread(target=self.check_wait_queue)
-        check_queue_thread.daemon = True  # 设置为守护线程，随主线程退出而退出
+        check_queue_thread.daemon = True
         check_queue_thread.start()
 
         # check client thread
         check_client_thread = threading.Thread(target=self.check_valid_clients)
-        check_client_thread.daemon = True  # 设置为守护线程，随主线程退出而退出
+        check_client_thread.daemon = True 
         check_client_thread.start()
 
         model_distributor_thread = threading.Thread(target=self.model_distributor)
@@ -396,7 +393,7 @@ class Server:
                         client.state = "online"
                         print(f"-> Listen: {client_addr} direct to listen_client_mes()")
                     else:
-                        # 线程池满，处理队列或关闭连接
+
                         if self.wait_queue.full():
                             m = self.generate_messages("loginState", "FULL")
                             self.send_client_mes(client, m)
@@ -426,7 +423,7 @@ class Server:
             return json.dumps({"type": type, "value": message})
         if type == "model":
             binary_data = self.tensor_to_byte(message[0].state_dict())
-            print(len(binary_data))
+            print(f"Size of model: {len(binary_data)} bytes")
             shape = message[1:]
             #print(shape)
             return json.dumps({"type": type, "shape": shape, "binary_data": binary_data})
@@ -539,7 +536,7 @@ class Server:
         return base64.b64encode(binary_data.getvalue()).decode("utf-8")
     def model_updator(self):
         while self.running:
-            time.sleep(0.1)
+            time.sleep(0.02)
             with self.clients_lock:
                 for client in self.clients:
                     #print(f"ip: {client.ip_address}")
@@ -555,7 +552,7 @@ class Server:
 
     def gradient_distributor(self):
         while self.running:
-            time.sleep(0.1)
+            time.sleep(0.02)
             with self.clients_lock:
                 counter = 0
                 for client in self.clients:
@@ -565,7 +562,8 @@ class Server:
                         client.gradient = None
                         counter += 1
             if counter!= 0:
-                print(f"-> Gradient Distributor: sent gradient to {counter} clients")
+                pass
+                #print(f"-> Gradient Distributor: sent gradient to {counter} clients")
 
     def parse_handle_mes(self, client, data):
         #print(f"From {client.ip_address}: {data}")
@@ -594,7 +592,7 @@ class Server:
                 client.trainSD = data.get('SD')
                 client.trainL = data.get('L')
                 client.batchN = data.get('batchN')
-                print(f"received batch {len(client.trainL)}")
+                #print(f"received batch {len(client.trainL)}")
             else:
                 print(f"~ parse_handle_mes: receive train SDL for non working client | state: {client.state}, ip: {client.ip_address}")
             return
@@ -615,11 +613,10 @@ class Server:
             print(len(train_accuracy))
             print(len(test_loss))
             print(len(test_accuracy))
-            # 创建一个 2x2 的 subplot 布局
+
             plt.figure(figsize=(14, 10))
 
-            # 第一个 subplot：训练损失
-            plt.subplot(2, 2, 1)  # 2行2列的第1个位置
+            plt.subplot(2, 2, 1) 
             plt.plot(train_loss, label='Train Loss', marker='o')
             plt.title('Train Loss')
             plt.xlabel('Epoch')
@@ -627,8 +624,8 @@ class Server:
             plt.legend()
             plt.grid(True)
 
-            # 第二个 subplot：训练准确率
-            plt.subplot(2, 2, 2)  # 2行2列的第2个位置
+
+            plt.subplot(2, 2, 2)
             plt.plot(train_accuracy, label='Train Accuracy', marker='o', color='orange')
             plt.title('Train Accuracy')
             plt.xlabel('Epoch')
@@ -636,8 +633,8 @@ class Server:
             plt.legend()
             plt.grid(True)
 
-            # 第三个 subplot：测试损失
-            plt.subplot(2, 2, 3)  # 2行2列的第3个位置
+
+            plt.subplot(2, 2, 3)
             plt.plot(test_loss, label='Test Loss', marker='o', color='green')
             plt.title('Test Loss')
             plt.xlabel('Epoch')
@@ -645,8 +642,8 @@ class Server:
             plt.legend()
             plt.grid(True)
 
-            # 第四个 subplot：测试准确率
-            plt.subplot(2, 2, 4)  # 2行2列的第4个位置
+
+            plt.subplot(2, 2, 4)
             plt.plot(test_accuracy, label='Test Accuracy', marker='o', color='red')
             plt.title('Test Accuracy')
             plt.xlabel('Epoch')
@@ -654,10 +651,8 @@ class Server:
             plt.legend()
             plt.grid(True)
 
-            # 调整子图间距
             plt.tight_layout()
 
-            # 显示整个图表
             plt.savefig('img.png')
             plt.close()
         print(f"~ parser: unknown data | ip: {client.ip_address} | d: {data}")
