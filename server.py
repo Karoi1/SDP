@@ -19,7 +19,8 @@ import matplotlib.pyplot as plt
 class modelManager:
     def __init__(self):
         self.idcounter = 0
-        self.Listmodel = np.array([], dtype=modelItem)
+        self.ListmodelLock = threading.Lock()
+        self.Listmodel = []
     def addModel(self, shape, split_layer):
         """
         Create a new model and store in self.Listmodel. ID is automatically generated
@@ -41,7 +42,8 @@ class modelManager:
         self.idcounter += 1
         modelID = self.idcounter
         Newmodel = modelItem(shape, id=modelID, split_layer=split_layer)
-        self.Listmodel = np.append(self.Listmodel, Newmodel)
+        with self.ListmodelLock:
+            self.Listmodel.append(Newmodel)
         return modelID, ""
 
     def check_model_exist(self, split_layer):
@@ -130,6 +132,8 @@ class modelManager:
         model.eval()
         split_layer = item.split_layer
         with torch.no_grad():
+            smashed_data = torch.tensor(smashed_data, dtype=torch.float32)
+            labels = torch.tensor(labels, dtype=torch.long)
             outputs = model.forward(smashed_data, split_layer)
             criterion = nn.CrossEntropyLoss()
             loss = criterion(outputs,labels)
@@ -138,7 +142,8 @@ class modelManager:
             _, predicted = torch.max(outputs,1)
             correct = (predicted == labels).sum().item()
             accuracy = correct/labels.size(0)
-            item.train_accuracy_hist = np.append(item.train_accuracy_hist, accuracy)
+            item.test_accuracy_hist = np.append(item.test_accuracy_hist, accuracy)
+        #print("here")
         return outputs, ""
     
     def train_for_id(self, id, smashed_data, labels):
@@ -161,7 +166,7 @@ class modelManager:
         lock = item.lock
         split_layer = item.split_layer
         with lock:
-            smash_data = torch.tensor(smashed_data, dtype=torch.float32)
+            smash_data = torch.tensor(smashed_data, dtype=torch.float32, requires_grad=True)
             labels = torch.tensor(labels, dtype=torch.long)
 
             criterion = nn.CrossEntropyLoss()
@@ -180,8 +185,8 @@ class modelManager:
             correct = (predicted == labels).sum().item()
             accuracy = correct/labels.size(0)
             item.train_accuracy_hist = np.append(item.train_accuracy_hist, accuracy)
-
-        return self.get_split_layer_gradient(id)
+        #print(smash_data.grad.shape)
+        return smash_data.grad, ""
 
     def get_split_layer_gradient(self, id):
         """
@@ -212,12 +217,13 @@ class modelManager:
         return gradients[0], ""
 
 class modelItem:
-    def __init__(self, shape, id=-1, lr=0.0001, split_layer=0):
+    def __init__(self, shape, id=-1, batch_size=128, lr=0.0001, split_layer=0):
         self.id = id
         self.split_layer = split_layer
         self.shape = shape
         self.model = None
         self.lr = lr
+        self.batch_size = batch_size
         self.build_model()
         self.optimizer = torch.optim.Adam(self.model.parameters(),lr=self.lr)
         self.lock = threading.Lock()
@@ -227,6 +233,7 @@ class modelItem:
         self.test_loss_hist = np.array([],dtype=np.float32)
     def build_model(self):
         I,W,O,L = self.shape
+        self.batch_size = W
         self.model = DynamicMLP(I,W,O,L)
         
 
@@ -273,22 +280,27 @@ class Client:
         self.socket = socket
         self.state = state
         self.prefer = prefer
-        self.trainSD = None
-        self.trainL = None
-        self.testSD = None
-        self.testL = None
-        self.gradient = None
-        self.batchN = None
+        self.InfoLock = threading.Lock()
+        self.TrainLock = threading.Lock()
+        self.TestLock = threading.Lock()
+        self.GLock = threading.Lock()
+        self.trainSD = []
+        self.trainL = []
+        self.testSD = []
+        self.testL = []
+        self.gradient = torch.tensor([])
+        self.batchN = 0
         self.subscribe = subscribe
         self.modelID = None
     def is_no_info(self):
+        # TODO not none but empty list
         attrList = ['trainSD', 'trainL', 'testSD', 'testL', 'gradient']
         for i in attrList:
             if getattr(self, i) is not None:
                 return False
         return True
-class Server:                    #TODO modelW = batch size send message
-    def __init__(self, host, port, max_connections, max_workers, max_wait_queue=5, broadcast_interval=60, input_size=784, output_size=10, modelL=5, modelW=128):
+class Server:                    
+    def __init__(self, host, port, max_connections, max_workers, max_wait_queue=5, broadcast_interval=60, input_size=784, output_size=10, modelL=5, modelW=256):
         
         # ip, port, listen socket
         self.host = host
@@ -319,6 +331,7 @@ class Server:                    #TODO modelW = batch size send message
         self.receiverpool = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
         # thread pool for sending messages
         self.senderpool = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+        self.mhandlerpool = concurrent.futures.ThreadPoolExecutor(max_workers=32)
         
         # list of all connected clients
         self.clients = []
@@ -341,6 +354,7 @@ class Server:                    #TODO modelW = batch size send message
         self.server_socket.listen(self.max_connections)
         self.server_socket.settimeout(1)
 
+        #self.start_threads()  TODO
         print("initialize brocast thread...")
         # 启动定时广播线程
         broadcast_thread = threading.Thread(target=self.background_broadcast)
@@ -366,9 +380,14 @@ class Server:                    #TODO modelW = batch size send message
         model_updater_thread.daemon = True
         model_updater_thread.start()
 
+        model_tester_thread = threading.Thread(target=self.model_tester)
+        model_tester_thread.daemon = True
+        model_tester_thread.start()
+
         gradient_distributor_thread = threading.Thread(target=self.gradient_distributor)
         gradient_distributor_thread.daemon = True
         gradient_distributor_thread.start()
+        
 
         print("========********[ Server On Board ]********========")
         print(f" === Listen at {self.host}: {self.port}")
@@ -414,9 +433,62 @@ class Server:                    #TODO modelW = batch size send message
             self.server_socket.close()
             self.receiverpool.shutdown()
             self.senderpool.shutdown()
+            self.mhandlerpool.shutdown()
             broadcast_thread.join()
             check_queue_thread.join()
-    
+            model_tester_thread.join()
+            check_client_thread.join()
+            model_distributor_thread.join()
+            model_updater_thread.join()
+            model_tester_thread.join()
+            gradient_distributor_thread.join()
+            
+            
+    def start_threads(self):
+        print("initialize brocast thread...")
+        # 启动定时广播线程
+        broadcast_thread = threading.Thread(target=self.background_broadcast)
+        broadcast_thread.daemon = True
+        #broadcast_thread.start()
+
+        #print("initialize checker thread...")
+        # check queue thread
+        check_queue_thread = threading.Thread(target=self.check_wait_queue)
+        check_queue_thread.daemon = True
+        check_queue_thread.start()
+
+        # check client thread
+        check_client_thread = threading.Thread(target=self.check_valid_clients)
+        check_client_thread.daemon = True 
+        check_client_thread.start()
+
+        model_distributor_thread = threading.Thread(target=self.model_distributor)
+        model_distributor_thread.daemon = True
+        model_distributor_thread.start()
+
+        model_updater_thread = threading.Thread(target=self.model_updator)
+        model_updater_thread.daemon = True
+        model_updater_thread.start()
+
+        model_tester_thread = threading.Thread(target=self.model_tester)
+        model_tester_thread.daemon = True
+        model_tester_thread.start()
+
+        gradient_distributor_thread = threading.Thread(target=self.gradient_distributor)
+        gradient_distributor_thread.daemon = True
+        gradient_distributor_thread.start()
+
+        while True:
+            if not self.running:
+                broadcast_thread.join()
+                check_queue_thread.join()
+                model_tester_thread.join()
+                check_client_thread.join()
+                model_distributor_thread.join()
+                model_updater_thread.join()
+                model_tester_thread.join()
+                gradient_distributor_thread.join()
+
 
     def generate_messages(self, type, message=None):
         if type == "loginState":
@@ -495,37 +567,37 @@ class Server:                    #TODO modelW = batch size send message
         
     def model_tester(self):
         while self.running:
-            time.sleep(0.5)
-            with self.clients_lock:
-                #print("update model check")
-                for client in self.clients:
-                    #print(f"ip: {client.ip_address}")
-                    if client.testSD is not None and client.testL is not None:
+            time.sleep(0.02)
+            #print("update model check")
+            for client in self.clients:
+                #print(f"ip: {client.ip_address}")
+                if client.testSD and client.testL:
+                    with client.TestLock:
                         id = client.modelID
-                        smashed_data = client.testSD
-                        labels = client.testL
-                        self.MM.forward_for_id(id,smashed_data,labels)
-                        client.testSD = None
-                        client.testL = None
-                        #print(client.ip_address,"train")
+                        smashed_data = client.testSD.copy()
+                        labels = client.testL.copy()
+                    self.MM.forward_for_id(id,smashed_data,labels)
+                    print("forward ", len(labels))
+                    with client.TestLock:
+                        client.testSD = []
+                        client.testL = []
     def model_distributor(self):
         while self.running:
             time.sleep(self.DMCD)
-            with self.clients_lock:
-                counter = 0
-                for client in self.clients:
-                    if client.state == "online waiting":
-                        #print(client.ip_address)
-                        id = client.modelID
-                        item, e = self.MM.getClientModel(id)
-                        if item is None:
-                            print(e)
-                        I,W,O,L = item.shape
-                        sub_model = item.model
-                        m = self.generate_messages("model", [sub_model,int(I),int(W),int(L)])
-                        self.send_client_mes(client, m)
-                        client.state = "working"
-                        counter += 1
+            counter = 0
+            for client in self.clients:
+                if client.state == "online waiting":
+                    #print(client.ip_address)
+                    id = client.modelID
+                    item, e = self.MM.getClientModel(id)
+                    if item is None:
+                        print(e)
+                    I,W,O,L = item.shape
+                    sub_model = item.model
+                    m = self.generate_messages("model", [sub_model,int(I),int(W),int(L)])
+                    self.send_client_mes(client, m)
+                    client.state = "working"
+                    counter += 1
             if counter != 0:
                 print(f"-> Model distributor: send model to {counter} clients")
 
@@ -537,30 +609,37 @@ class Server:                    #TODO modelW = batch size send message
     def model_updator(self):
         while self.running:
             time.sleep(0.02)
-            with self.clients_lock:
-                for client in self.clients:
-                    #print(f"ip: {client.ip_address}")
-                    if client.trainSD is not None and client.trainL is not None:
+            #print("model update")
+            for client in self.clients:
+                #print(f"ip: {client.ip_address}")
+                if client.trainSD and client.trainL:
+                    with client.TrainLock:
                         id = client.modelID
-                        smashed_data = client.trainSD
-                        labels = client.trainL
-                        gradient, _ = self.MM.train_for_id(id,smashed_data,labels)
-                        client.gradient = gradient
-                        client.trainSD = None
-                        client.trainL = None
+                        smashed_data = client.trainSD.copy()
+                        labels = client.trainL.copy()
+                        client.trainSD = []
+                        client.trainL = []
+                    gradient, _ = self.MM.train_for_id(id,smashed_data,labels)
+                    #print("get G ",gradient.shape)
+                    with client.GLock:
+                        #print("save G")
+                        client.gradient = torch.cat((client.gradient, gradient))
                         #print(client.ip_address,"train")
 
     def gradient_distributor(self):
         while self.running:
             time.sleep(0.02)
-            with self.clients_lock:
-                counter = 0
-                for client in self.clients:
-                    if client.gradient is not None:
-                        m = self.generate_messages("gradient", client.gradient)
-                        self.send_client_mes(client, m)
-                        client.gradient = None
-                        counter += 1
+            counter = 0
+            #print("G distribute")
+            for client in self.clients:
+                if client.gradient.numel() != 0:
+                    with client.GLock:
+                        gradient = client.gradient.clone()
+                        client.gradient = torch.tensor([])
+                    print("send G", gradient.shape)
+                    m = self.generate_messages("gradient", gradient)
+                    self.send_client_mes(client, m)
+                    counter += 1
             if counter!= 0:
                 pass
                 #print(f"-> Gradient Distributor: sent gradient to {counter} clients")
@@ -581,6 +660,7 @@ class Server:                    #TODO modelW = batch size send message
                 id, error = self.MM.addModel(self.shape, prefer)
                 if id is None:
                     print(f" !! parse_handle_mes | data: {data} | error: {error}")
+                    return
                 client.modelID = id
 
             if client.state == "online":
@@ -589,73 +669,93 @@ class Server:                    #TODO modelW = batch size send message
             return
         if type == "train SDL":
             if client.state == "working":
-                client.trainSD = data.get('SD')
-                client.trainL = data.get('L')
-                client.batchN = data.get('batchN')
+                with client.TrainLock:
+                    #print("add pkg")
+                    client.trainSD += data.get('SD')
+                    client.trainL += data.get('L')
+                    client.batchN += data.get('batchN')
                 #print(f"received batch {len(client.trainL)}")
             else:
                 print(f"~ parse_handle_mes: receive train SDL for non working client | state: {client.state}, ip: {client.ip_address}")
             return
         if type == "test SDL":
-            client.testSD = data.get('SD')
-            client.testL = data.get('L')
-            batchN = data.get('batchN')
+            with client.TestLock:
+                client.testSD += data.get('SD')
+                client.testL += data.get('L')
+                client.batchN += data.get('batchN')
             return
         if type == "End":
             print("end")
-            item,_ = self.MM.getModel(1)
-            print(item.split_layer)
-            train_loss = item.train_loss_hist
-            train_accuracy = item.train_accuracy_hist
-            test_loss = item.test_loss_hist
-            test_accuracy = item.test_accuracy_hist
-            print(len(train_loss))
-            print(len(train_accuracy))
-            print(len(test_loss))
-            print(len(test_accuracy))
-
-            plt.figure(figsize=(14, 10))
-
-            plt.subplot(2, 2, 1) 
-            plt.plot(train_loss, label='Train Loss', marker='o')
-            plt.title('Train Loss')
-            plt.xlabel('Epoch')
-            plt.ylabel('Loss')
-            plt.legend()
-            plt.grid(True)
-
-
-            plt.subplot(2, 2, 2)
-            plt.plot(train_accuracy, label='Train Accuracy', marker='o', color='orange')
-            plt.title('Train Accuracy')
-            plt.xlabel('Epoch')
-            plt.ylabel('Accuracy')
-            plt.legend()
-            plt.grid(True)
-
-
-            plt.subplot(2, 2, 3)
-            plt.plot(test_loss, label='Test Loss', marker='o', color='green')
-            plt.title('Test Loss')
-            plt.xlabel('Epoch')
-            plt.ylabel('Loss')
-            plt.legend()
-            plt.grid(True)
-
-
-            plt.subplot(2, 2, 4)
-            plt.plot(test_accuracy, label='Test Accuracy', marker='o', color='red')
-            plt.title('Test Accuracy')
-            plt.xlabel('Epoch')
-            plt.ylabel('Accuracy')
-            plt.legend()
-            plt.grid(True)
-
-            plt.tight_layout()
-
-            plt.savefig('img.png')
-            plt.close()
+            print(client.batchN)
+            error = self.save_model_hist_to_img(1)
+            print("error: ",error)
         print(f"~ parser: unknown data | ip: {client.ip_address} | d: {data}")
+
+    def save_model_hist_to_img(self, id, img_name="img.png"):
+        """
+        Save the acc, loss history of model of the corresponding id into image
+        Parameters:
+            :id: the model id
+            :img_name: the saved image name
+        Return
+            :Str: if there is error
+        """
+        item, error = self.MM.getModel(id)
+        if item is None:
+            return error
+        
+        train_loss = item.train_loss_hist
+        train_accuracy = item.train_accuracy_hist
+        test_loss = item.test_loss_hist
+        test_accuracy = item.test_accuracy_hist
+        print(len(train_loss))
+        print(len(train_accuracy))
+        print(len(test_loss))
+        print(len(test_accuracy))
+
+        plt.figure(figsize=(14, 10))
+
+        plt.subplot(2, 2, 1) 
+        plt.plot(train_loss, label='Train Loss', marker='o')
+        plt.title('Train Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.legend()
+        plt.grid(True)
+
+
+        plt.subplot(2, 2, 2)
+        plt.plot(train_accuracy, label='Train Accuracy', marker='o', color='orange')
+        plt.title('Train Accuracy')
+        plt.xlabel('Epoch')
+        plt.ylabel('Accuracy')
+        plt.legend()
+        plt.grid(True)
+
+
+        plt.subplot(2, 2, 3)
+        plt.plot(test_loss, label='Test Loss', marker='o', color='green')
+        plt.title('Test Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.legend()
+        plt.grid(True)
+
+
+        plt.subplot(2, 2, 4)
+        plt.plot(test_accuracy, label='Test Accuracy', marker='o', color='red')
+        plt.title('Test Accuracy')
+        plt.xlabel('Epoch')
+        plt.ylabel('Accuracy')
+        plt.legend()
+        plt.grid(True)
+
+        plt.tight_layout()
+
+        plt.savefig(img_name)
+        plt.close()
+        return ""
+
 
     def listen_client_mes(self, client):
         try:
@@ -664,11 +764,14 @@ class Server:                    #TODO modelW = batch size send message
                 print(f"+++ current workers: {self.current_worker}")
 
             while self.running:
+                #print("listen here")
                 try:
                     mes = client.socket.recv(pow(2,24)).decode('utf-8')
                     if not mes:
                         break
-                    self.parse_handle_mes(client, mes)
+                    #self.parse_handle_mes(client, mes)
+                    self.mhandlerpool.submit(self.parse_handle_mes, client, mes)
+                    #print("listen now direct")
                 except socket.timeout:
                     print(f"~ listen_client_mes TimeOut | ip: {client.ip_address}")
                     break

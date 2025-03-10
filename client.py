@@ -12,7 +12,7 @@ import os
 import io
 
 class client:
-    def __init__(self, server_ip, server_port, Tx, prefer=1, batchN=128, zipMetric=None):
+    def __init__(self, server_ip, server_port, Tx, prefer=1, batchN=64, zipMetric=None):
         self.server_ip = server_ip
         self.server_port = server_port
         self.prefer = prefer
@@ -41,9 +41,11 @@ class client:
         })
 
     # TODO generate message (type, mes)
+    # TODO 多线程处理发送和接收。目前发送需要上一轮接收完毕。可以考虑每一段时间接收一次
     def generate_message(self, type, mes=None):
         if type == "End":
             m = json.dumps({"type": type})
+            print(m)
             return m
         return json.dumps({"type": type})
     def start(self):
@@ -65,7 +67,6 @@ class client:
                     self.batch = self.get_next_train_batch()
                     if self.batch is None:
                         self.mode = "test"
-                        self.itertest = iter(self.testset_loader)
                         continue 
 
                 if self.mode == "test":
@@ -102,13 +103,13 @@ class client:
         try:
 
             trainset = torchvision.datasets.MNIST(root='./data', train=True, download=True, transform=transform)
-            trainloader = torch.utils.data.DataLoader(trainset, batch_size=self.batchN, shuffle=True, drop_last=True)
+            trainloader = torch.utils.data.DataLoader(trainset, batch_size=self.batchN, shuffle=True, drop_last=False)
             self.trainset_loader = trainloader
             self.itertrain = iter(trainloader)
 
 
             testset = torchvision.datasets.MNIST(root='./data', train=False, download=True, transform=transform)
-            testloader = torch.utils.data.DataLoader(testset, batch_size=self.batchN, shuffle=False, drop_last=True)
+            testloader = torch.utils.data.DataLoader(testset, batch_size=self.batchN, shuffle=False, drop_last=False)
             self.testset_loader = testloader
             self.itertest = iter(testloader)
 
@@ -209,7 +210,7 @@ class client:
         layer_L.weight.grad = L_weight_gradient.detach().clone()
         layer_L.bias.grad = L_bias_gradient.detach().clone()
 
-        optimizer = torch.optim.SGD(self.model.parameters(), lr=0.0001)  # TODO: 用消息让server和client的lr同步
+        optimizer = torch.optim.SGD(self.model.parameters(), lr=0.001)  # TODO: 用消息让server和client的lr同步
         optimizer.step()
         optimizer.zero_grad()
 
@@ -258,10 +259,10 @@ class client:
             self.disconnect()
             return
 
-        self.model.eval()
         if batch is None:
             print(f" !! State: {self.state} | compute_smashed_data() -> error: batch is None")
-        
+
+        self.model.eval()
         batch_data, batch_labels = batch
         # flatten the data
         batch_data = batch_data.view(batch_data.size(0), -1)
@@ -409,7 +410,7 @@ class client:
 
 
 if __name__ == "__main__":
-    client = client("127.0.0.1", 65432,123)
+    client = client("127.0.0.1", 65432,123,prefer=1)
     print('press enter to start client')
     input()
     client.start()
