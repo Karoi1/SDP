@@ -12,7 +12,7 @@ import os
 import io
 
 class client:
-    def __init__(self, server_ip, server_port, Tx, prefer=1, batchN=64, zipMetric=None):
+    def __init__(self, server_ip, server_port, Tx, prefer=1, batchN=128, zipMetric=None):
         self.server_ip = server_ip
         self.server_port = server_port
         self.prefer = prefer
@@ -32,6 +32,8 @@ class client:
         self.batch_idx = 0
         self.zipMetric = zipMetric
         self.mode = "train"
+        self.testLock = threading.Lock()
+        self.trainLock = threading.Lock()
     
     def info_to_json(self):
         return json.dumps({
@@ -121,12 +123,14 @@ class client:
     
     def get_next_train_batch(self):
         try:
-            return next(self.itertrain)
+            with self.trainLock:
+                return next(self.itertrain)
         except StopIteration:
             return None
     def get_next_test_batch(self):
         try:
-            return next(self.itertest)
+            with self.testLock:
+                return next(self.itertest)
         except StopIteration:
             return None
     def upload_SDL_to_server(self):

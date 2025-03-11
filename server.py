@@ -17,7 +17,8 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 class modelManager:
-    def __init__(self):
+    def __init__(self, allocate_metric="one to one"):
+        self.allocate_metric=allocate_metric
         self.idcounter = 0
         self.ListmodelLock = threading.Lock()
         self.Listmodel = []
@@ -216,6 +217,108 @@ class modelManager:
                 i += 1
         return gradients[0], ""
 
+    def integrate_model_id(self, id_list, split_layer=1, metric='avg', delete=False):
+
+        """
+        Integrate the model in id_list
+        !!! old models will be deleted if set delete=True, default delete=False
+        The model must be of the same shape
+        Parameters:
+            :id_list: list of id of models to be integrated
+            :split_layer: the split layer of the new model
+            :metric: the metric used to compute the new model parameters
+            :Note: metric type:= 'avg' | 'Navg' | 'Wloss' | 'Wacc'
+        Returns:
+            :modelItem(): if success, the new model
+            :None: if fail
+            :Str: error message
+        """
+        item_list = []
+        #append the model item into list
+        for id in id_list:
+            item, error = self.getModel(id)
+            if item is None:
+                return None, "MM: integrate_model: "+error
+            item_list.append(item)
+        
+        # prepare all locks
+        lock_list = [item.lock for item in item_list]
+        model_list = [item.model for item in item_list]
+        # check if all model shape is same
+        shape_list = [item.shape for item in item_list]
+        for i in range(len(shape_list)):
+            if shape_list[i] != shape_list[0]:
+                return None, f"MM: integrate_model: model shape is not same, [0] = {shape_list[0]}, [{i}] = {shape_list[i]}"
+        
+        # get all locks
+        for l in lock_list:
+            l.acquire()
+        newModelID = self.addModel(shape_list[0],split_layer=split_layer)
+        newModelItem = self.getModel(newModelID)
+        newModel = newModelItem.model
+        if metric == 'avg':
+            for key in newModel.state_dict().keys():
+                avg_param = 0
+                for model in model_list:
+                    avg_param += model.state_dict()[key]
+                avg_param /= len(model_list)
+                newModel.state_dict()[key].copy_(avg_param)
+            
+            for l in lock_list:
+                l.release()
+            return newModel, ""
+        
+        for l in lock_list:
+                l.release()
+        return None, f"MM: integrate_model: Unknown metric: {metric}"
+
+    def copy_model(self, id, split_layer):
+        """
+        Copy the model of the id to a new model, specify the split layer of the new model
+        Parameters:
+            :id: the old model id
+            :split_layer: specify the split layer of the new model
+        Returns:
+            :Int: the new model id if success
+            :None: if fail
+            :Str: error message
+        """
+        item,error = self.getModel(id)
+        if item is None:
+            return None, error
+        
+        # create a new model
+        shape = item.shape
+        _,_,_,L = shape
+        newModelID = self.addModel(shape, split_layer)
+        newModelItem = self.getModel(newModelID)
+        newModel = newModelItem.model
+        for i in range(L):
+            newModel.layers[i].weight.data.copy_(item.model.layers[i].weight.data)
+            newModel.layers[i].bias.data.copy_(item.model.layers[i].bias.data)
+        return newModelID, ""
+
+    def allocate_model_to_client(self, shape, client):
+        """
+        Distribute the model to client. store the model id into client.modelID
+        Parameters:
+            :client: the client object
+        Returns Nothing
+        """
+        prefer = client.prefer
+        # single: only one model for each different split layer
+        if self.allocate_metric == "single":
+            if self.check_model_exist(prefer):
+                client.modelID,_ = self.getRandomModelID(prefer)
+            else:
+                client.modelID,_ = self.addModel(shape, prefer)
+            return
+        # each client is allocated with one model
+        if self.allocate_metric == "one to one":
+            print("one to one")
+            client.modelID,_ = self.addModel(shape, prefer)
+            return
+
 class modelItem:
     def __init__(self, shape, id=-1, batch_size=128, lr=0.0001, split_layer=0):
         self.id = id
@@ -224,6 +327,8 @@ class modelItem:
         self.model = None
         self.lr = lr
         self.batch_size = batch_size
+        self.N = 0
+        self.reference = -1
         self.build_model()
         self.optimizer = torch.optim.Adam(self.model.parameters(),lr=self.lr)
         self.lock = threading.Lock()
@@ -233,7 +338,8 @@ class modelItem:
         self.test_loss_hist = np.array([],dtype=np.float32)
     def build_model(self):
         I,W,O,L = self.shape
-        self.batch_size = W
+        if self.split_layer >= L:
+            self.split_layer = L-1
         self.model = DynamicMLP(I,W,O,L)
         
 
@@ -299,6 +405,7 @@ class Client:
             if getattr(self, i) is not None:
                 return False
         return True
+    
 class Server:                    
     def __init__(self, host, port, max_connections, max_workers, max_wait_queue=5, broadcast_interval=60, input_size=784, output_size=10, modelL=5, modelW=256):
         
@@ -348,6 +455,7 @@ class Server:
         self.shape = [input_size,modelW,output_size,modelL]
         self.MM = modelManager()
     def start(self):
+        """To Start all of the things"""
         print("creating socket...")
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server_socket.bind((self.host, self.port))
@@ -363,12 +471,12 @@ class Server:
 
         #print("initialize checker thread...")
         # check queue thread
-        check_queue_thread = threading.Thread(target=self.check_wait_queue)
+        check_queue_thread = threading.Thread(target=self.queue_checker)
         check_queue_thread.daemon = True
         check_queue_thread.start()
 
         # check client thread
-        check_client_thread = threading.Thread(target=self.check_valid_clients)
+        check_client_thread = threading.Thread(target=self.cleaner)
         check_client_thread.daemon = True 
         check_client_thread.start()
 
@@ -393,19 +501,25 @@ class Server:
         print(f" === Listen at {self.host}: {self.port}")
 
         try:
+            # while running
             while self.running:
                 try:
+                    # receive socket
                     client_socket, client_addr = self.server_socket.accept()
                     print(f"-> Listen: connection from: {client_addr}")
                 except socket.timeout:
                     continue
-
+                
+                # create client object
                 client = Client(client_addr, socket=client_socket)
                 with self.clients_lock:
+                    # with lock, append object to list
                     self.clients.append(client)
                 
                 with self.worker_lock:
+                    #check if there is space available
                     if self.current_worker < self.max_workers:
+                        # There is enough space, forward to thread to listen
                         m = self.generate_messages("loginState", "OK")
                         self.send_client_mes(client, m)
                         self.receiverpool.submit(self.listen_client_mes, client)
@@ -414,11 +528,13 @@ class Server:
                     else:
 
                         if self.wait_queue.full():
+                            # if queue if full, disconnect
                             m = self.generate_messages("loginState", "FULL")
                             self.send_client_mes(client, m)
                             client.socket.close()
                             print(f"-> Listen: Queue Full, connection break: {client_addr}")
                         else:
+                            # if queue has space, put in queue
                             client.state = "queueing"
                             m = self.generate_messages("loginState", "Queueing")
                             self.send_client_mes(client, m)
@@ -429,6 +545,7 @@ class Server:
         except KeyboardInterrupt:
             print("Server stopped.")
         finally:
+            # shut down all
             self.running = False
             self.server_socket.close()
             self.receiverpool.shutdown()
@@ -445,6 +562,7 @@ class Server:
             
             
     def start_threads(self):
+        # TODO
         print("initialize brocast thread...")
         # 启动定时广播线程
         broadcast_thread = threading.Thread(target=self.background_broadcast)
@@ -453,12 +571,12 @@ class Server:
 
         #print("initialize checker thread...")
         # check queue thread
-        check_queue_thread = threading.Thread(target=self.check_wait_queue)
+        check_queue_thread = threading.Thread(target=self.queue_checker)
         check_queue_thread.daemon = True
         check_queue_thread.start()
 
         # check client thread
-        check_client_thread = threading.Thread(target=self.check_valid_clients)
+        check_client_thread = threading.Thread(target=self.cleaner)
         check_client_thread.daemon = True 
         check_client_thread.start()
 
@@ -491,6 +609,14 @@ class Server:
 
 
     def generate_messages(self, type, message=None):
+        """
+        Generate message for the corresponding type
+        Parameters:
+            :type: (Str) the message type
+            :message: The message
+        Return:
+            :json: processed message
+        """
         if type == "loginState":
             return json.dumps({"type": type, "value": message})
         if type == "model":
@@ -507,28 +633,29 @@ class Server:
         
         print(" !! generate_messages | invalid type: \"{type}\", m: \"{message}\"")
 
-    def check_valid_clients(self):
-        """定期检查客户端连接状态并清理离线客户端"""
+    def cleaner(self):
+        """Thread: check and swap the disconnected clients"""
         while self.running:
-            time.sleep(10)  # 每隔10秒检查一次
+            # 10s 1 round
+            time.sleep(10)
 
-            # 获取离线客户端
             offline_clients = []
             m = self.generate_messages("hb")
             with self.clients_lock:
+                # get the lock 
                 for client in self.clients:
                     try:
-                        # 尝试从客户端发送一个心跳请求
+                        # send a heart beat
                         client.socket.sendall(m)
-                        # 如果客户端断开，会抛出异常
                     except (socket.error, OSError):
+                        # if disconnected, append it to list
                         if client.is_no_info():
                             offline_clients.append(client)
 
-                # 从客户端列表中移除离线客户端
+                # delete the clients from list
                 self.clients = [c for c in self.clients if c not in offline_clients]
 
-            # 关闭离线客户端的socket
+            # close sockets of off line client
             for client in offline_clients:
                 try:
                     client.socket.close()
@@ -538,11 +665,10 @@ class Server:
                 print(f"-> Cleaner: Removed {len(offline_clients)} offline client")
 
 
-    def check_wait_queue(self):
-        """定期检查等待队列并调度任务"""
+    def queue_checker(self):
+        """Thread: Check the wait queue"""
         while self.running:
-            time.sleep(1)  # 每隔1秒检查一次
-                # 如果线程池有空闲资源，并且等待队列不为空
+            time.sleep(1)
             with self.worker_lock:
                     if self.current_worker < self.max_workers:
                         try:
@@ -556,16 +682,24 @@ class Server:
                         except queue.Empty:
                             pass
                         except Exception as e:
-                            print(f" !! check_wait_queue() Error: {e}")
+                            print(f" !! queue_checker() Error: {e}")
                             
     
-    def send_client_mes(self, client, mes):
+    def send_client_mes(self, client:Client, mes):
+        """
+        Send message to client
+        Parameters:
+            :client: client
+            :mes: message
+        Return Nothing
+        """
         try:
             client.socket.sendall(mes.encode('utf-8'))
         except Exception as e:
             print(f" !! send_client_mes Error | ip: {client.ip_address} | e: {e} | m: {mes}")
         
     def model_tester(self):
+        """Thread for testing model"""
         while self.running:
             time.sleep(0.02)
             #print("update model check")
@@ -582,6 +716,7 @@ class Server:
                         client.testSD = []
                         client.testL = []
     def model_distributor(self):
+        """Thread for distributing model"""
         while self.running:
             time.sleep(self.DMCD)
             counter = 0
@@ -594,6 +729,7 @@ class Server:
                         print(e)
                     I,W,O,L = item.shape
                     sub_model = item.model
+                    lr = item.lr
                     m = self.generate_messages("model", [sub_model,int(I),int(W),int(L)])
                     self.send_client_mes(client, m)
                     client.state = "working"
@@ -601,12 +737,9 @@ class Server:
             if counter != 0:
                 print(f"-> Model distributor: send model to {counter} clients")
 
-    
-    def tensor_to_byte(self, tensor):
-        binary_data = io.BytesIO()
-        torch.save(tensor, binary_data)
-        return base64.b64encode(binary_data.getvalue()).decode("utf-8")
+
     def model_updator(self):
+        """Thread for updating model and return gradients"""
         while self.running:
             time.sleep(0.02)
             #print("model update")
@@ -627,6 +760,7 @@ class Server:
                         #print(client.ip_address,"train")
 
     def gradient_distributor(self):
+        """Thread for distributing gradients"""
         while self.running:
             time.sleep(0.02)
             counter = 0
@@ -644,7 +778,14 @@ class Server:
                 pass
                 #print(f"-> Gradient Distributor: sent gradient to {counter} clients")
 
-    def parse_handle_mes(self, client, data):
+    def parse_handle_mes(self, client:Client, data):
+        """
+        Parse and handle the message from client
+        Parameters:
+            :client: client object
+            :data: the json 
+        Return Nothing
+        """
         #print(f"From {client.ip_address}: {data}")
         data = json.loads(data)
         type = data.get('type')
@@ -654,14 +795,7 @@ class Server:
             prefer = data.get('prefer')
             client.prefer = prefer
             #print("prefer",prefer)
-            if self.MM.check_model_exist(prefer):
-                client.modelID = self.MM.getRandomModelID(prefer)
-            else:
-                id, error = self.MM.addModel(self.shape, prefer)
-                if id is None:
-                    print(f" !! parse_handle_mes | data: {data} | error: {error}")
-                    return
-                client.modelID = id
+            self.MM.allocate_model_to_client(self.shape, client)
 
             if client.state == "online":
                 client.state = "online waiting"
@@ -687,7 +821,7 @@ class Server:
         if type == "End":
             print("end")
             print(client.batchN)
-            error = self.save_model_hist_to_img(1)
+            error = self.save_model_hist_to_img(client.modelID, f"{client.modelID}.png")
             print("error: ",error)
         print(f"~ parser: unknown data | ip: {client.ip_address} | d: {data}")
 
@@ -708,8 +842,11 @@ class Server:
         train_accuracy = item.train_accuracy_hist
         test_loss = item.test_loss_hist
         test_accuracy = item.test_accuracy_hist
+        print("save for id: ", id)
+        print("train round")
         print(len(train_loss))
         print(len(train_accuracy))
+        print("test round")
         print(len(test_loss))
         print(len(test_accuracy))
 
@@ -758,18 +895,23 @@ class Server:
 
 
     def listen_client_mes(self, client):
+        """Thread for listening client message"""
         try:
             with self.worker_lock:
+                # get lock and update worker number
                 self.current_worker += 1
                 print(f"+++ current workers: {self.current_worker}")
 
             while self.running:
+                # while running
                 #print("listen here")
                 try:
+                    # Receive message and decode
                     mes = client.socket.recv(pow(2,24)).decode('utf-8')
                     if not mes:
                         break
                     #self.parse_handle_mes(client, mes)
+                    # forward to a new thread to parse and handle the message
                     self.mhandlerpool.submit(self.parse_handle_mes, client, mes)
                     #print("listen now direct")
                 except socket.timeout:
@@ -785,14 +927,19 @@ class Server:
                 self.current_worker -= 1
                 print(f"--- current workers: {self.current_worker}")
 
+    def tensor_to_byte(self, tensor):
+        """Encode tensor to bytes"""
+        binary_data = io.BytesIO()
+        torch.save(tensor, binary_data)
+        return base64.b64encode(binary_data.getvalue()).decode("utf-8")
+
     def broadcast_state(self):
-        # 确定服务器状态
+        # TODO
         if self.current_worker < self.max_workers:
             state_message = "Server State: OPEN"
         else:
             state_message = "Server State: CLOSED"
 
-        # 广播状态给所有在线客户端
         print(f"-> broadcast: \"{state_message}\"")
         disconnected_clients = []
         with self.clients_lock:
@@ -800,18 +947,18 @@ class Server:
                 try:
                     client.socket.sendall(state_message.encode('utf-8'))
                 except Exception:
-                    # 如果客户端断开连接，记录并移除
-                    disconnected_clients.append(client)
-
-            # 移除断开的客户端
-            self.clients = [c for c in self.clients if c not in disconnected_clients]
+                    pass
 
     def background_broadcast(self):
+        """Thread for broadcasting"""
         while self.running:
             time.sleep(self.broadcast_interval) 
             self.broadcast_state()
 
-# 运行服务器
+    def fedavg(self):
+        """Thread for fedavg"""
+
 if __name__ == "__main__":
+    #Run
     server = Server("127.0.0.1", 65432, 5, 5)
     server.start()
