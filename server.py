@@ -83,10 +83,12 @@ class modelManager:
             :None: if no model found
             :Str: error message
         """
-        model = next((item for item in self.Listmodel if item.id == id), None)
-        if model is None:
+        item = next((item for item in self.Listmodel if item.id == id), None)
+        if item is None:
             return None, f" !! Model Manager | getModel(): no model of {id} found"
-        return model, ""
+        if item.reference != -1:
+            return self.getModel(item.reference)
+        return item, ""
     def getClientModel(self, id):
         """
         Get the client-side model of the corresponding id
@@ -132,6 +134,8 @@ class modelManager:
         model = item.model
         model.eval()
         split_layer = item.split_layer
+        with item.lock:
+            item.testN += len(labels)
         with torch.no_grad():
             smashed_data = torch.tensor(smashed_data, dtype=torch.float32)
             labels = torch.tensor(labels, dtype=torch.long)
@@ -167,6 +171,7 @@ class modelManager:
         lock = item.lock
         split_layer = item.split_layer
         with lock:
+            item.trainN += len(labels)
             smash_data = torch.tensor(smashed_data, dtype=torch.float32, requires_grad=True)
             labels = torch.tensor(labels, dtype=torch.long)
 
@@ -253,24 +258,32 @@ class modelManager:
         # get all locks
         for l in lock_list:
             l.acquire()
-        newModelID = self.addModel(shape_list[0],split_layer=split_layer)
-        newModelItem = self.getModel(newModelID)
-        newModel = newModelItem.model
+
+        newModelItem = None
         if metric == 'avg':
+            newModelID,_ = self.addModel(shape_list[0],split_layer=split_layer)
+            newModelItem,_ = self.getModel(newModelID)
+            newModel = newModelItem.model
             for key in newModel.state_dict().keys():
                 avg_param = 0
                 for model in model_list:
                     avg_param += model.state_dict()[key]
                 avg_param /= len(model_list)
                 newModel.state_dict()[key].copy_(avg_param)
-            
-            for l in lock_list:
-                l.release()
-            return newModel, ""
-        
+            for item in item_list:
+                item.reference = newModelID
+
         for l in lock_list:
                 l.release()
-        return None, f"MM: integrate_model: Unknown metric: {metric}"
+        if newModelItem is not None and delete: #note, cannot do now because you havn't direct client to the new model by the code following
+            with self.ListmodelLock:
+                pass
+                #self.Listmodel = [item for item in self.Listmodel if item.id not in id_list]
+        if newModelItem is None:
+            return None, f"MM: integrate_model: Unknown metric: {metric}"
+        
+
+        return newModelItem, ""
 
     def copy_model(self, id, split_layer):
         """
@@ -327,7 +340,8 @@ class modelItem:
         self.model = None
         self.lr = lr
         self.batch_size = batch_size
-        self.N = 0
+        self.trainN = 0
+        self.testN = 0
         self.reference = -1
         self.build_model()
         self.optimizer = torch.optim.Adam(self.model.parameters(),lr=self.lr)
@@ -407,7 +421,7 @@ class Client:
         return True
     
 class Server:                    
-    def __init__(self, host, port, max_connections, max_workers, max_wait_queue=5, broadcast_interval=60, input_size=784, output_size=10, modelL=5, modelW=256):
+    def __init__(self, host, port, max_connections, max_workers, max_wait_queue=5, broadcast_interval=60, input_size=784, output_size=10, modelL=4, modelW=128):
         
         # ip, port, listen socket
         self.host = host
@@ -447,6 +461,8 @@ class Server:
         # model_distributor CD
         self.DMCD = 5
         self.UDCD = 5
+        # specify the limited time of one epoch (second) to run fedavg
+        self.epoch_time = 1
 
         self.inputSize = input_size
         self.outputSize = output_size
@@ -454,6 +470,8 @@ class Server:
         self.modelW = modelW
         self.shape = [input_size,modelW,output_size,modelL]
         self.MM = modelManager()
+
+
     def start(self):
         """To Start all of the things"""
         print("creating socket...")
@@ -608,7 +626,7 @@ class Server:
                 gradient_distributor_thread.join()
 
 
-    def generate_messages(self, type, message=None):
+    def generate_messages(self, type, message=""):
         """
         Generate message for the corresponding type
         Parameters:
@@ -622,9 +640,10 @@ class Server:
         if type == "model":
             binary_data = self.tensor_to_byte(message[0].state_dict())
             print(f"Size of model: {len(binary_data)} bytes")
-            shape = message[1:]
+            lr = message[1]
+            shape = message[2:]
             #print(shape)
-            return json.dumps({"type": type, "shape": shape, "binary_data": binary_data})
+            return json.dumps({"type": type, "shape": shape, "lr": lr, "binary_data": binary_data})
         if type == "hb":
             return json.dumps({"type": type}).encode('utf-8')
         if type == "gradient":
@@ -696,7 +715,7 @@ class Server:
         try:
             client.socket.sendall(mes.encode('utf-8'))
         except Exception as e:
-            print(f" !! send_client_mes Error | ip: {client.ip_address} | e: {e} | m: {mes}")
+            print(f" !! send_client_mes Error | ip: {client.ip_address} | e: {e} | m: {1}")
         
     def model_tester(self):
         """Thread for testing model"""
@@ -710,11 +729,11 @@ class Server:
                         id = client.modelID
                         smashed_data = client.testSD.copy()
                         labels = client.testL.copy()
-                    self.MM.forward_for_id(id,smashed_data,labels)
-                    print("forward ", len(labels))
-                    with client.TestLock:
                         client.testSD = []
                         client.testL = []
+                    self.MM.forward_for_id(id,smashed_data,labels)
+                    print("forward ", len(labels))
+                        
     def model_distributor(self):
         """Thread for distributing model"""
         while self.running:
@@ -724,13 +743,20 @@ class Server:
                 if client.state == "online waiting":
                     #print(client.ip_address)
                     id = client.modelID
+                    item,_ = self.MM.getModel(id)
+                    
+                    #if there is model update
+                    if item.reference != -1:
+                        client.modelID = item.reference
+                        id = item.reference
+                    
                     item, e = self.MM.getClientModel(id)
                     if item is None:
                         print(e)
                     I,W,O,L = item.shape
                     sub_model = item.model
                     lr = item.lr
-                    m = self.generate_messages("model", [sub_model,int(I),int(W),int(L)])
+                    m = self.generate_messages("model", [sub_model,lr,int(I),int(W),int(L)])
                     self.send_client_mes(client, m)
                     client.state = "working"
                     counter += 1
@@ -748,6 +774,13 @@ class Server:
                 if client.trainSD and client.trainL:
                     with client.TrainLock:
                         id = client.modelID
+                        item,_ = self.MM.getModel(id)
+
+                        #if there is model update
+                        if item.reference != -1:
+                            client.modelID = item.reference
+                            id = item.reference
+                        
                         smashed_data = client.trainSD.copy()
                         labels = client.trainL.copy()
                         client.trainSD = []
@@ -851,6 +884,7 @@ class Server:
         print(len(test_accuracy))
 
         plt.figure(figsize=(14, 10))
+        plt.title(f"The results of model id: {id}")
 
         plt.subplot(2, 2, 1) 
         plt.plot(train_loss, label='Train Loss', marker='o')
@@ -957,8 +991,16 @@ class Server:
 
     def fedavg(self):
         """Thread for fedavg"""
-
-if __name__ == "__main__":
+        while self.running:
+            time.sleep(self.epoch_time)
+            id_list = []
+            for item in self.MM.Listmodel:
+                if item.reference == -1:
+                    # note, no shape check here. But the shape should be the same for all model now
+                    # may check by new attribute "task name"
+                    id_list.append(item.id)
+            self.MM.integrate_model_id(id_list)
+if __name__ == "__main__":  
     #Run
     server = Server("127.0.0.1", 65432, 5, 5)
     server.start()

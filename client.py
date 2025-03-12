@@ -11,16 +11,55 @@ import torchvision.transforms as transforms
 import os
 import io
 
+
+class MLP(nn.Module):
+    def __init__(self,inputSize, width, layersN):
+        super(MLP, self).__init__()
+        self.layersN = layersN
+        self.layers = nn.ModuleList()
+        self.layers.append(nn.Linear(inputSize, width))
+        for _ in range(layersN-1):
+            self.layers.append(nn.Linear(width, width))
+    
+    def forward(self, x):
+        for layer in self.layers:
+            x = torch.relu(layer(x))
+        return x
+    def get_last_layer_input(self,x):
+        with torch.no_grad():
+            for i in range(self.layersN-1):
+                x = torch.relu(self.layers[i](x))
+        return x
+
+
+class modelItem:
+    def __init__(self,shape,lr=0.0001):
+        self.shape = shape
+        self.lr = lr
+        self.trainN = 0
+        self.testN = 0
+        self.model = None
+        self.build_model()
+        self.optimizer = torch.optim.SGD(self.model.parameters(),lr=self.lr)
+    def build_model(self):
+        I,W,L = self.shape
+        if L < 1:
+            L = 1
+        self.model = MLP(I,W,L)
+
+
 class client:
-    def __init__(self, server_ip, server_port, Tx, prefer=1, batchN=128, zipMetric=None):
+    def __init__(self, server_ip, server_port, Tx, prefer=1, batchN=128, zipMetric=None, send_pkg_CD=0.01):
         self.server_ip = server_ip
         self.server_port = server_port
         self.prefer = prefer
         self.Tx = Tx
         self.socket = None
+        self.modelItem = None
         self.model = None
-        self.batch = None
-        self.gradient = None
+        self.batch = [torch.tensor([]), torch.tensor([])]
+        self.send_pkg_CD = send_pkg_CD
+        self.gradient = torch.tensor([])
         self.running = True
         self.state = "offline"
         self.trainset_loader = None
@@ -34,6 +73,8 @@ class client:
         self.mode = "train"
         self.testLock = threading.Lock()
         self.trainLock = threading.Lock()
+
+        self.test = 0
     
     def info_to_json(self):
         return json.dumps({
@@ -43,7 +84,7 @@ class client:
         })
 
     # TODO generate message (type, mes)
-    # TODO 多线程处理发送和接收。目前发送需要上一轮接收完毕。可以考虑每一段时间接收一次
+    # TODO 多线程处理发送和接收。目前发送需要上一轮接收完毕。可以考虑每一段时间接收一次  Final: 还是单线程，但是用了另一种方法来完成
     def generate_message(self, type, mes=None):
         if type == "End":
             m = json.dumps({"type": type})
@@ -66,25 +107,27 @@ class client:
                 self.receive_model_from_server()
             if self.state == "working":
                 if self.mode == "train":
-                    self.batch = self.get_next_train_batch()
-                    if self.batch is None:
+                    batch = self.get_next_train_batch()
+                    if batch is None:
+                        # if there is still data that has not received gradient, continue receiving.
+                        # self.wait_train_complete()
                         self.mode = "test"
                         continue 
 
                 if self.mode == "test":
-                    self.batch = self.get_next_test_batch()
-                    if self.batch is None:
+                    batch = self.get_next_test_batch()
+                    if batch is None:
                         self.formal_end() 
 
-                if self.batch is not None:
-                    self.compute_smashed_data(self.batch)
+                if batch is not None:
+                    self.compute_smashed_data(batch)
 
             if self.state == "ready upload":
                 self.upload_SDL_to_server()
             if self.state == "wait gradient":
-                self.receive_gradient_from_server()
+                self.receive_gradient_from_server(self.send_pkg_CD)  #Note to add timeout
             if self.state == "update local model":
-                self.update_model()
+                self.update_model(batch)
         print("========= Client stopped =========")
 
     def formal_end(self):
@@ -153,22 +196,26 @@ class client:
         self.SDL = None
         #print("==> Complete: upload_SDL_to_server()")
         #print("-------------------------------------------")
-    def receive_gradient_from_server(self):
+    def receive_gradient_from_server(self, timeout=None):
         #print(f"==> Start: receive_gradient_from_server()")
         if self.socket is None:
             print(f" !! State: {self.state} | receive_gradient_from_server() -> error: socket is None")
             self.disconnect()
             return
         try:
-            msg = self.socket.recv(1024000).decode()
+            #self.socket.settimeout(timeout)
+            msg = self.socket.recv(pow(2,25)).decode()
             data = json.loads(msg)
+        except socket.timeout:
+            self.state = "working"
+            return                        #Note add except socket.timeout
         except Exception as e:
             print(f"!! State: {self.state} | receive_gradient_from_server() -> error: {e}")
             self.disconnect()
             return
         type = data.get("type")
         if type == "hb":
-            return self.receive_gradient_from_server()
+            return self.receive_gradient_from_server(timeout)
         if type != "gradient":
             print(f" !! State: {self.state} | receive_gradient_from_server() -> error: type is not gradient")
             self.disconnect()
@@ -187,66 +234,69 @@ class client:
             return
         
         self.state = "update local model"
-        self.gradient = gradient
+        self.gradient = torch.cat((self.gradient,gradient))
         #print(f"==> complete: receive_gradient_from_server()")
         #print("-------------------------------------------")
         
         
-    def update_model(self):
+    def update_model(self,batch):
         #print(f"==> Start: update_model()")
         if self.model is None:
             print(f" !! State: {self.state} | update_model() -> error: model is None")
             self.disconnect()
             return
-        if self.gradient is None:
+        if self.gradient.numel() == 0:
             print(f" !! State: {self.state} | update_model() -> error: gradient is None")
             self.disconnect()
             return
+        
+        
+        # receive n sample's gradient, retrive the samples
+        n,_ = self.gradient.shape
+        m = len(self.batch[0])
+        x = min(m,n)
+        self.test += x
+        print(self.test,m,n)
+        if x == 0:
+            self.disconnect()
+            return
+        
+        batch_data, label = self.batch
         # get the input data at Lth layer
-        batch_data, _ = self.batch
+        batch_data = batch_data[:x]
+        self.batch = [batch_data[x:], label[x:]]
+        gradient = self.gradient[:x]
+        self.gradient = self.gradient[x:]
+
         batch_data = batch_data.view(batch_data.size(0), -1)
         L_input = self.model.get_last_layer_input(batch_data)
         # receive L+1th layer gradient, backward to Lth layer
         layer_L = self.model.layers[-1]
-        L_weight_gradient = torch.matmul(L_input.T, self.gradient).T
-        L_bias_gradient = self.gradient.sum(dim=0)
+        L_weight_gradient = torch.matmul(L_input.T, gradient).T
+        L_bias_gradient = gradient.sum(dim=0)
 
         layer_L.weight.grad = L_weight_gradient.detach().clone()
         layer_L.bias.grad = L_bias_gradient.detach().clone()
 
-        optimizer = torch.optim.SGD(self.model.parameters(), lr=0.001)  # TODO: 用消息让server和client的lr同步
+        optimizer = self.modelItem.optimizer 
         optimizer.step()
         optimizer.zero_grad()
-
-        self.gradient = None
         self.state = "working"
         #print(f"==> complete: update_model()")
         #print("-------------------------------------------")
-    def create_dynamicMLP(self, inputSize, width, layersN):
-        if layersN < 1:
-            print(f" !! State: {self.state} | create_dynamicMLP() -> error: layers must be at least 1")
-            self.disconnect()
-            return None
-        class MLP(nn.Module):
-            def __init__(self,inputSize, width, layersN):
-                super(MLP, self).__init__()
-                self.layers = nn.ModuleList()
-                self.layers.append(nn.Linear(inputSize, width))
-                for _ in range(layersN-1):
-                    self.layers.append(nn.Linear(width, width))
-            
-            def forward(self, x):
-                for layer in self.layers:
-                    x = torch.relu(layer(x))
-                return x
-            def get_last_layer_input(self,x):
-                with torch.no_grad():
-                    for i in range(layersN-1):
-                        x = torch.relu(self.layers[i](x))
-                return x
 
-        return MLP(inputSize, width, layersN)
-
+    def wait_train_complete(self):
+        while len(self.batch[0]) != 0:
+            print("1G,",len(self.gradient))
+            print("1L:", len(self.batch[0]))
+            self.receive_gradient_from_server()
+            print("2G,",len(self.gradient))
+            print("2L:", len(self.batch[0]))
+            self.update_model()
+            print("3G,",len(self.gradient))
+            print("3L:", len(self.batch[0]))
+        print("G,",len(self.gradient))
+        print("L:", len(self.batch[0]))
 
     def compute_smashed_data(self, batch):
         #print(f"==> Start: compute_smashed_data()")
@@ -279,6 +329,8 @@ class client:
             "L": batch_labels.tolist(),
             "batchN": len(batch_labels)
         }
+        if self.mode == "train":   #note here
+            self.batch = [torch.cat((self.batch[0],batch[0])),torch.cat((self.batch[1], batch[1]))]
         self.state = "ready upload"
         #print(f"==> Complete: compute_smashed_data()")
         #print("-------------------------------------------")
@@ -300,7 +352,7 @@ class client:
         try:
             parsed_message = json.loads(message)
         except json.JSONDecodeError:
-            print(f" !! State: {self.state} | try_login() decode json -> MSG: {message}, error: {e}")
+            print(f" !! State: {self.state} | try_login() decode json -> MSG: {1}, error: {e}")
             self.disconnect()
             return
 
@@ -358,15 +410,15 @@ class client:
     def receive_model_from_server(self):
         print(f"==> Start: receive_model_from_server()")
         try:
-            data = self.socket.recv(pow(2,24)).decode('utf8')
+            data = self.socket.recv(pow(2,30)).decode('utf8')
         except socket.error as e:
-            print(f" !! State: {self.state} | receive_model_from_server() recv msg error -> MSG: {data}, error: {e}")
+            print(f" !! State: {self.state} | receive_model_from_server() recv msg error -> MSG: {1}, error: {e}")
             self.disconnect()
             return
         try:
             parsed_message = json.loads(data)
         except json.JSONDecodeError as e:
-            print(f" !! State: {self.state} | receive_model_from_server() json decode error -> MSG: {data}, error: {e}")
+            print(f" !! State: {self.state} | receive_model_from_server() json decode error -> MSG: {1}, error: {e}")
             self.disconnect()
             return
         
@@ -379,8 +431,8 @@ class client:
             self.disconnect()
             return
         
+        lr = parsed_message.get("lr")
         shape = parsed_message.get("shape")
-        I, W, L = shape
         encoded_weight = parsed_message.get("binary_data")
 
         if not encoded_weight:
@@ -395,9 +447,10 @@ class client:
             self.disconnect()
             return
         
-        self.model = self.create_dynamicMLP(I, W, L)
+        self.modelItem = modelItem(shape,lr)
+        self.model = self.modelItem.model
         if self.model is None:
-            print(f" !! State: {self.state} | receive_model_from_server() -> failed to create MLP with [I W O L] = [{I} {W} {L}]")
+            print(f" !! State: {self.state} | receive_model_from_server() -> failed to create MLP with [I W O L] = [{shape}]")
             self.disconnect()
             return
         
