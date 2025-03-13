@@ -394,34 +394,42 @@ class DynamicMLP(nn.Module):
 
 
 class Client:
-    def __init__(self, ip_address, tx=None, socket=None, state="queueing", prefer=1,subscribe="gradient"):
+    def __init__(self, ip_address, tx=None, socket=None, state="queueing", prefer=1,subscribe="gradient", maxN=10):
         self.ip_address = ip_address
         self.Tx = tx
         self.socket = socket
         self.state = state
         self.prefer = prefer
         self.InfoLock = threading.Lock()
-        self.TrainLock = threading.Lock()
+        self.TrainLock = threading.Lock()              #Note: 好像queue不用锁，后面删了再测
         self.TestLock = threading.Lock()
         self.GLock = threading.Lock()
-        self.trainSD = []
-        self.trainL = []
-        self.testSD = []
-        self.testL = []
-        self.gradient = torch.tensor([])
+        self.maxN = maxN
+        self.trainSDL = queue.Queue(maxN*2)
+        self.testSDL = queue.Queue(maxN*10)
+        self.gradient = queue.Queue(maxN)
+
         self.batchN = 0
         self.subscribe = subscribe
         self.modelID = None
     def is_no_info(self):
+        return False         
         # TODO not none but empty list
-        attrList = ['trainSD', 'trainL', 'testSD', 'testL', 'gradient']
+        attrList = ['trainSDL', 'trainL', 'testSDL', 'testL', 'gradient']
         for i in attrList:
             if getattr(self, i) is not None:
                 return False
         return True
     
+    def set_bufferSize(self, maxN):
+        # Note: this will reflesh all queue. no save now
+        self.maxN = maxN
+        self.trainSDL = queue.Queue(maxN*2)
+        self.testSDL = queue.Queue(maxN*10)
+        self.gradient = queue.Queue(maxN)
+
 class Server:                    
-    def __init__(self, host, port, max_connections, max_workers, max_wait_queue=5, broadcast_interval=60, input_size=784, output_size=10, modelL=4, modelW=128):
+    def __init__(self, host, port, max_connections, max_workers, max_wait_queue=5, broadcast_interval=60, input_size=784, output_size=10, modelL=5, modelW=256):
         
         # ip, port, listen socket
         self.host = host
@@ -470,6 +478,8 @@ class Server:
         self.modelW = modelW
         self.shape = [input_size,modelW,output_size,modelL]
         self.MM = modelManager()
+
+
 
 
     def start(self):
@@ -544,8 +554,8 @@ class Server:
                         client.state = "online"
                         print(f"-> Listen: {client_addr} direct to listen_client_mes()")
                     else:
-
-                        if self.wait_queue.full():
+                        success = self.putinQueue(self.wait_queue, client, False)
+                        if not success:
                             # if queue if full, disconnect
                             m = self.generate_messages("loginState", "FULL")
                             self.send_client_mes(client, m)
@@ -556,7 +566,6 @@ class Server:
                             client.state = "queueing"
                             m = self.generate_messages("loginState", "Queueing")
                             self.send_client_mes(client, m)
-                            self.wait_queue.put(client)
                             print(f"-> Listen: {client_addr} direct to queue")
 
 
@@ -702,8 +711,26 @@ class Server:
                             pass
                         except Exception as e:
                             print(f" !! queue_checker() Error: {e}")
-                            
+
+    def retriveQueue(self, q:queue.Queue, wait=True):
+        try:
+            if wait:
+                return q.get()
+            else:
+                return q.get_nowait()
+        except queue.Empty:
+            return None
     
+    def putinQueue(self, q:queue.Queue, element, wait=True):
+        try:
+            if wait:
+                q.put(element)
+            else:
+                q.put_nowait(element)
+            return True
+        except queue.Full:
+            return False
+
     def send_client_mes(self, client:Client, mes):
         """
         Send message to client
@@ -724,15 +751,13 @@ class Server:
             #print("update model check")
             for client in self.clients:
                 #print(f"ip: {client.ip_address}")
-                if client.testSD and client.testL:
-                    with client.TestLock:
-                        id = client.modelID
-                        smashed_data = client.testSD.copy()
-                        labels = client.testL.copy()
-                        client.testSD = []
-                        client.testL = []
-                    self.MM.forward_for_id(id,smashed_data,labels)
-                    print("forward ", len(labels))
+                one_batch = self.retriveQueue(client.testSDL)
+                if one_batch is None:
+                    continue
+                id = client.modelID
+                smashed_data, labels = one_batch
+                result, _ = self.MM.forward_for_id(id,smashed_data,labels)
+                #print("forward ", len(labels))
                         
     def model_distributor(self):
         """Thread for distributing model"""
@@ -770,46 +795,46 @@ class Server:
             time.sleep(0.02)
             #print("model update")
             for client in self.clients:
-                #print(f"ip: {client.ip_address}")
-                if client.trainSD and client.trainL:
-                    with client.TrainLock:
-                        id = client.modelID
-                        item,_ = self.MM.getModel(id)
-
-                        #if there is model update
-                        if item.reference != -1:
-                            client.modelID = item.reference
-                            id = item.reference
-                        
-                        smashed_data = client.trainSD.copy()
-                        labels = client.trainL.copy()
-                        client.trainSD = []
-                        client.trainL = []
-                    gradient, _ = self.MM.train_for_id(id,smashed_data,labels)
-                    #print("get G ",gradient.shape)
-                    with client.GLock:
-                        #print("save G")
-                        client.gradient = torch.cat((client.gradient, gradient))
-                        #print(client.ip_address,"train")
+                #print(f"ip: {client.ip_address}")    
+                one_batch = self.retriveQueue(client.trainSDL)
+                if one_batch is None:
+                    continue
+                id = client.modelID
+                smashed_data,labels = one_batch
+                gradient, e = self.MM.train_for_id(id,smashed_data,labels)
+                #print("error ",e)
+                #print("get G ",gradient.shape)
+                #with client.GLock:          #in design the gradient queue should not overflow Lock change note
+                if gradient is not None:
+                    self.putinQueue(client.gradient, gradient)
+                    #print(client.ip_address,"train")
 
     def gradient_distributor(self):
         """Thread for distributing gradients"""
         while self.running:
-            time.sleep(0.02)
+            time.sleep(0.3)
             counter = 0
             #print("G distribute")
             for client in self.clients:
-                if client.gradient.numel() != 0:
-                    with client.GLock:
-                        gradient = client.gradient.clone()
-                        client.gradient = torch.tensor([])
+                gradient = []
+                c = 0
+                while c < client.maxN:
+                    g = self.retriveQueue(client.gradient,False)
+                    if g is None:
+                        break
+                    gradient.append(g)
+                    c += 1
+                #if c != 0:
+                    #print("retrive",c)
+                if gradient:
+                    gradient = torch.cat(gradient,dim=0)
                     print("send G", gradient.shape)
                     m = self.generate_messages("gradient", gradient)
                     self.send_client_mes(client, m)
                     counter += 1
-            if counter!= 0:
-                pass
-                #print(f"-> Gradient Distributor: sent gradient to {counter} clients")
+        if counter!= 0:
+            pass
+            #print(f"-> Gradient Distributor: sent gradient to {counter} clients")
 
     def parse_handle_mes(self, client:Client, data):
         """
@@ -828,34 +853,43 @@ class Server:
             prefer = data.get('prefer')
             client.prefer = prefer
             #print("prefer",prefer)
+            maxN = data.get("Buffer Size")
+            client.set_bufferSize(maxN)
             self.MM.allocate_model_to_client(self.shape, client)
 
             if client.state == "online":
                 client.state = "online waiting"
-                
             return
+        
         if type == "train SDL":
             if client.state == "working":
-                with client.TrainLock:
-                    #print("add pkg")
-                    client.trainSD += data.get('SD')
-                    client.trainL += data.get('L')
+                one_batch = [data.get('SD'), data.get('L')]
+                success = self.putinQueue(client.trainSDL, one_batch, False)
+                #print("add pkg")
+                if success:
                     client.batchN += data.get('batchN')
+                else:
+                    print(f"parese_handle_mes | receive train SDL: client: {client.ip_address} queue full, omit batch")
                 #print(f"received batch {len(client.trainL)}")
             else:
                 print(f"~ parse_handle_mes: receive train SDL for non working client | state: {client.state}, ip: {client.ip_address}")
             return
+        
         if type == "test SDL":
-            with client.TestLock:
-                client.testSD += data.get('SD')
-                client.testL += data.get('L')
+            one_batch = [data.get('SD'), data.get('L')]
+            success = self.putinQueue(client.testSDL, one_batch, False)
+            if success:
                 client.batchN += data.get('batchN')
+            else:
+                print(f"parese_handle_mes | receive test SDL: client: {client.ip_address} queue full, omit batch")
             return
+        
         if type == "End":
             print("end")
             print(client.batchN)
             error = self.save_model_hist_to_img(client.modelID, f"{client.modelID}.png")
-            print("error: ",error)
+            #print("error: ",error)
+            return
         print(f"~ parser: unknown data | ip: {client.ip_address} | d: {data}")
 
     def save_model_hist_to_img(self, id, img_name="img.png"):

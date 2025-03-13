@@ -10,6 +10,7 @@ import torchvision
 import torchvision.transforms as transforms
 import os
 import io
+import queue
 
 
 class MLP(nn.Module):
@@ -49,17 +50,23 @@ class modelItem:
 
 
 class client:
-    def __init__(self, server_ip, server_port, Tx, prefer=1, batchN=128, zipMetric=None, send_pkg_CD=0.01):
+    def __init__(self, server_ip, server_port, Tx, prefer=1, max_send=5, batchsize=128, zipMetric=None, send_pkg_CD=0.05):
         self.server_ip = server_ip
         self.server_port = server_port
         self.prefer = prefer
+
+        # the maximum # of batch in sending buffer (used in wait_complete())
+        self.max_send_N = max_send
+        # set the size of receive buffer to be twice of sending buffer
+        self.max_receive_N = max_send*2
+
         self.Tx = Tx
         self.socket = None
         self.modelItem = None
         self.model = None
-        self.batch = [torch.tensor([]), torch.tensor([])]
+        self.batchQ = queue.Queue(maxsize=max_send)
+        self.gradient = queue.Queue(maxsize=self.max_receive_N)
         self.send_pkg_CD = send_pkg_CD
-        self.gradient = torch.tensor([])
         self.running = True
         self.state = "offline"
         self.trainset_loader = None
@@ -67,20 +74,20 @@ class client:
         self.itertrain = None
         self.itertest = None
         self.SDL = {}
-        self.batchN = batchN
-        self.batch_idx = 0
+        self.batchSize = batchsize
         self.zipMetric = zipMetric
         self.mode = "train"
         self.testLock = threading.Lock()
         self.trainLock = threading.Lock()
 
-        self.test = 0
+        
     
     def info_to_json(self):
         return json.dumps({
             "type": "info",
             "Tx": self.Tx,
-            "prefer": self.prefer
+            "prefer": self.prefer,
+            "Buffer Size": self.max_send_N
         })
 
     # TODO generate message (type, mes)
@@ -107,10 +114,14 @@ class client:
                 self.receive_model_from_server()
             if self.state == "working":
                 if self.mode == "train":
+                    if self.batchQ.full(): #if there is too much data waiting gradient, stop sending
+                        #print("too large now")
+                        self.wait_complete()
+                        continue    
                     batch = self.get_next_train_batch()
                     if batch is None:
                         # if there is still data that has not received gradient, continue receiving.
-                        # self.wait_train_complete()
+                        self.wait_complete()
                         self.mode = "test"
                         continue 
 
@@ -127,7 +138,7 @@ class client:
             if self.state == "wait gradient":
                 self.receive_gradient_from_server(self.send_pkg_CD)  #Note to add timeout
             if self.state == "update local model":
-                self.update_model(batch)
+                self.update_model()
         print("========= Client stopped =========")
 
     def formal_end(self):
@@ -148,13 +159,13 @@ class client:
         try:
 
             trainset = torchvision.datasets.MNIST(root='./data', train=True, download=True, transform=transform)
-            trainloader = torch.utils.data.DataLoader(trainset, batch_size=self.batchN, shuffle=True, drop_last=False)
+            trainloader = torch.utils.data.DataLoader(trainset, batch_size=self.batchSize, shuffle=True, drop_last=False)
             self.trainset_loader = trainloader
             self.itertrain = iter(trainloader)
 
 
             testset = torchvision.datasets.MNIST(root='./data', train=False, download=True, transform=transform)
-            testloader = torch.utils.data.DataLoader(testset, batch_size=self.batchN, shuffle=False, drop_last=False)
+            testloader = torch.utils.data.DataLoader(testset, batch_size=self.batchSize, shuffle=False, drop_last=False)
             self.testset_loader = testloader
             self.itertest = iter(testloader)
 
@@ -203,8 +214,8 @@ class client:
             self.disconnect()
             return
         try:
-            #self.socket.settimeout(timeout)
-            msg = self.socket.recv(pow(2,25)).decode()
+            self.socket.settimeout(timeout)
+            msg = self.socket.recv(pow(2,30)).decode()
             data = json.loads(msg)
         except socket.timeout:
             self.state = "working"
@@ -233,40 +244,43 @@ class client:
             self.disconnect()
             return
         
+        # split the gradient into multiple batches
+        split = torch.split(gradient, self.batchSize, dim=0)
+        for g in split:
+            self.gradient.put(g)
         self.state = "update local model"
-        self.gradient = torch.cat((self.gradient,gradient))
+        
         #print(f"==> complete: receive_gradient_from_server()")
         #print("-------------------------------------------")
         
         
-    def update_model(self,batch):
+    def update_model(self):
         #print(f"==> Start: update_model()")
         if self.model is None:
             print(f" !! State: {self.state} | update_model() -> error: model is None")
             self.disconnect()
             return
-        if self.gradient.numel() == 0:
-            print(f" !! State: {self.state} | update_model() -> error: gradient is None")
-            self.disconnect()
+        if self.gradient.empty():
+            print(f" ~ State: {self.state} | update_model() -> return with empty gradient")
             return
-        
-        
+        if self.batchQ.empty():
+            print(f" ~ State: {self.state} | update_model() -> return with empty batchQ")
+            return
         # receive n sample's gradient, retrive the samples
-        n,_ = self.gradient.shape
-        m = len(self.batch[0])
-        x = min(m,n)
-        self.test += x
-        print(self.test,m,n)
-        if x == 0:
+        try:
+            one_batch = self.batchQ.get_nowait()
+            batch_data, label = one_batch
+        except queue.Empty:
+            print("batchQ is empty")
             self.disconnect()
             return
-        
-        batch_data, label = self.batch
+        try:
+            gradient = self.gradient.get_nowait()
+        except queue.Empty:
+            print("self.gradient is empty")
+            self.disconnect()
+            return
         # get the input data at Lth layer
-        batch_data = batch_data[:x]
-        self.batch = [batch_data[x:], label[x:]]
-        gradient = self.gradient[:x]
-        self.gradient = self.gradient[x:]
 
         batch_data = batch_data.view(batch_data.size(0), -1)
         L_input = self.model.get_last_layer_input(batch_data)
@@ -285,18 +299,19 @@ class client:
         #print(f"==> complete: update_model()")
         #print("-------------------------------------------")
 
-    def wait_train_complete(self):
-        while len(self.batch[0]) != 0:
-            print("1G,",len(self.gradient))
-            print("1L:", len(self.batch[0]))
-            self.receive_gradient_from_server()
-            print("2G,",len(self.gradient))
-            print("2L:", len(self.batch[0]))
+    def wait_complete(self):
+        # first receive all gradient
+        batchN = self.batchQ.qsize()
+        if batchN == 0:
+            return
+        while self.gradient.qsize() < batchN:
+            self.receive_gradient_from_server(0.5)
+        #print(batchN)
+        #print(self.gradient.qsize())
+        
+        # update all
+        while not self.batchQ.empty():
             self.update_model()
-            print("3G,",len(self.gradient))
-            print("3L:", len(self.batch[0]))
-        print("G,",len(self.gradient))
-        print("L:", len(self.batch[0]))
 
     def compute_smashed_data(self, batch):
         #print(f"==> Start: compute_smashed_data()")
@@ -330,7 +345,7 @@ class client:
             "batchN": len(batch_labels)
         }
         if self.mode == "train":   #note here
-            self.batch = [torch.cat((self.batch[0],batch[0])),torch.cat((self.batch[1], batch[1]))]
+            self.batchQ.put(batch)
         self.state = "ready upload"
         #print(f"==> Complete: compute_smashed_data()")
         #print("-------------------------------------------")
